@@ -1,0 +1,8 @@
+{
+    "version":{
+        "major": 8,
+        "minor": 0
+    },
+    "target": "sm_89",
+    "address_size": 64
+}
