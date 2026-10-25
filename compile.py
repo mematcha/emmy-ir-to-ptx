@@ -35,7 +35,7 @@ class PTXGenerator:
     def _write(self, key: str, value: str) -> None:
         # config keys
         if key == "version" or key == "target" or key == "address_size":
-            self.ptx_lines.append(f"{key} {value}")
+            self.ptx_lines.append(f".{key} {value}")
         # line break key
         elif key == "line_break":
             self.ptx_lines.append("\n" * value)
