@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from compile import PTXConstants
+from compile import PTXConstants, PTX_VERSION
 
 
 @pytest.fixture
@@ -88,11 +88,13 @@ class TestPTXIntegerConstants:
         assert isinstance(constants.integer(42), str)
 
     def test_configured_ptx_version(self, constants):
-        assert constants.version == "9.4"
+        # The submission contract targets PTX ISA 8.0 (sm_89 needs >= 7.8).
+        assert PTX_VERSION == "8.0"
+        assert constants.version == PTX_VERSION
 
     def test_integer_does_not_modify_version(self, constants):
         constants.integer(42)
-        assert constants.version == "9.4"
+        assert constants.version == PTX_VERSION
 
 
 class TestPTXFloatingConstants:

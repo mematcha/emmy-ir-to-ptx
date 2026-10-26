@@ -1,4 +1,5 @@
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -84,7 +85,9 @@ def test_pointwise_terminates(kernel):
     assert ptx.rstrip().endswith("}")
 
 
-def test_unsupported_reduction_fails():
+def test_reduction_kernel_lowers():
+    # Cooperative reductions are supported; this used to be an
+    # "unsupported" example before the reduction lowering existed.
     reduction_path = (
         ROOT
         / "problems"
@@ -99,8 +102,23 @@ def test_unsupported_reduction_fails():
         require_meta=True,
     ).parse()
 
-    with pytest.raises(NotImplementedError):
-        EmmyIRLowering(kernel).lower()
+    ptx = EmmyIRLowering(kernel).lower()
+
+    assert ".visible .entry k_sum_1_reduce(" in ptx
+    assert "shfl.sync.bfly.b32" in ptx
+    assert "bar.sync 0;" in ptx
+
+
+def test_unsupported_statement_fails_explicitly(kernel):
+    # An IR statement kind with no lowering must raise, never emit
+    # silently wrong PTX.
+    class WarpMagic:
+        pass
+
+    broken = dataclasses.replace(kernel, body=(WarpMagic(),))
+
+    with pytest.raises(NotImplementedError, match="WarpMagic"):
+        EmmyIRLowering(broken).lower()
 
 
 
