@@ -3476,6 +3476,535 @@ class EmmyIRLowering:
 
         self.gen.label(second_end)
 
+    def _lower_rmsnorm(self, tile):
+        """Lower row-wise weighted f32 RMSNorm."""
+
+        stmts = tuple(tile.body)
+        kinds = tuple(type(s).__name__ for s in stmts)
+
+        expected = (
+            "StridedLoop", "WarpShuffle", "Smem",
+            "Cond", "Sync", "TreeHalve",
+            "Load", "Assign", "Assign",
+            "Load", "Assign", "Assign", "Assign",
+            "StridedLoop",
+        )
+
+        if kinds != expected or len(tile.axes) != 2:
+            raise NotImplementedError(
+                f"Unsupported RMSNorm IR: {kinds}"
+            )
+
+        (
+            reduce_loop, shuffle, smem,
+            store_cond, sync, tree,
+            count_load, reciprocal_count, mean_mul,
+            epsilon_load, epsilon_add, sqrt_stmt,
+            reciprocal_norm, output_loop,
+        ) = stmts
+
+        row_axis, thread_axis = tile.axes
+
+        def op(stmt):
+            return self._operation_name(stmt.op).lower()
+
+        def names(index):
+            return tuple(
+                getattr(expr, "name", None)
+                for expr in index
+            )
+
+        def extent(axis):
+            return getattr(axis.extent, "value", axis.extent)
+
+        def scalar_zero(load):
+            return (
+                len(load.names) == 1
+                and len(load.index) == 1
+                and type(load.index[0]).__name__ == "Literal"
+                and load.index[0].value == 0
+                and load.dtype.name == "f32"
+            )
+
+        reduce_body = tuple(reduce_loop.body)
+        output_body = tuple(output_loop.body)
+
+        if (
+            tuple(type(s).__name__ for s in reduce_body)
+            != ("Load", "Assign", "Accum")
+            or tuple(type(s).__name__ for s in output_body)
+            != ("Load", "Assign", "Load", "Assign", "Write")
+        ):
+            raise NotImplementedError(
+                "Unsupported RMSNorm loop bodies"
+            )
+
+        load_x, square, accum = reduce_body
+        out_x, mul_factor, load_w, mul_weight, write = output_body
+
+        if (
+            op(square) not in ("multiply", "mul")
+            or tuple(square.args)
+                != (load_x.names[0], load_x.names[0])
+            or op(accum) != "add"
+            or accum.value != square.name
+            or op(reciprocal_count) != "reciprocal"
+            or tuple(reciprocal_count.args)
+                != (count_load.names[0],)
+            or op(mean_mul) not in ("multiply", "mul")
+            or tuple(mean_mul.args)
+                != (accum.name, reciprocal_count.name)
+            or op(epsilon_add) != "add"
+            or tuple(epsilon_add.args)
+                != (epsilon_load.names[0], mean_mul.name)
+            or op(sqrt_stmt) != "sqrt"
+            or tuple(sqrt_stmt.args) != (epsilon_add.name,)
+            or op(reciprocal_norm) != "reciprocal"
+            or tuple(reciprocal_norm.args)
+                != (sqrt_stmt.name,)
+            or op(mul_factor) not in ("multiply", "mul")
+            or tuple(mul_factor.args)
+                != (out_x.names[0], reciprocal_norm.name)
+            or op(mul_weight) not in ("multiply", "mul")
+            or tuple(mul_weight.args)
+                != (load_w.names[0], mul_factor.name)
+            or tuple(write.values) != (mul_weight.name,)
+        ):
+            raise NotImplementedError(
+                "Unsupported RMSNorm arithmetic"
+            )
+
+        if not scalar_zero(count_load) or not scalar_zero(epsilon_load):
+            raise NotImplementedError(
+                "Expected scalar count and epsilon loads"
+            )
+
+        if (
+            len(load_x.names) != 1
+            or len(out_x.names) != 1
+            or len(load_w.names) != 1
+            or load_x.dtype.name != "f32"
+            or out_x.dtype.name != "f32"
+            or load_w.dtype.name != "f32"
+            or names(load_x.index)
+                != (row_axis.name, reduce_loop.axis.name)
+            or names(out_x.index)
+                != (row_axis.name, output_loop.axis.name)
+            or names(load_w.index)
+                != (output_loop.axis.name,)
+            or names(write.index)
+                != (row_axis.name, output_loop.axis.name)
+            or load_x.input != out_x.input
+            or write.atomic
+        ):
+            raise NotImplementedError(
+                "Unsupported RMSNorm tensor access"
+            )
+
+        rows = extent(row_axis)
+        threads = extent(thread_axis)
+        columns = extent(reduce_loop.axis)
+
+        if (
+            not all(
+                type(v) is int and v > 0
+                for v in (rows, threads, columns)
+            )
+            or extent(output_loop.axis) != columns
+            or threads != 128
+            or tuple(self.kernel.launch["grid"])
+                != (rows, 1, 1)
+            or tuple(self.kernel.launch["block"])
+                != (threads, 1, 1)
+        ):
+            raise NotImplementedError(
+                "Unsupported RMSNorm launch geometry"
+            )
+
+        def valid_loop(loop):
+            return (
+                loop.end is None
+                and loop.seed
+                and type(loop.start).__name__ == "Var"
+                and loop.start.name == thread_axis.name
+                and type(loop.step).__name__ == "Literal"
+                and loop.step.value == threads
+            )
+
+        if not valid_loop(reduce_loop) or not valid_loop(output_loop):
+            raise NotImplementedError(
+                "Unsupported RMSNorm loop configuration"
+            )
+
+        warps = threads // 32
+
+        if (
+            shuffle.length != 32
+            or tuple(shuffle.state) != (accum.name,)
+            or len(shuffle.combine_states) != 1
+            or op(shuffle.combine_states[0]) != "add"
+            or tuple(smem.extents) != (warps,)
+            or smem.dtype != "float"
+            or tuple(tree.bufs) != (smem.name,)
+            or tuple(tree.state) != (accum.name,)
+            or tree.length != warps
+            or len(tree.combine_states) != 1
+            or op(tree.combine_states[0]) != "add"
+            or sync.warp
+            or sync.barrier_id != 0
+        ):
+            raise NotImplementedError(
+                "Unsupported RMSNorm cooperative reduction"
+            )
+
+        if (
+            type(store_cond.cond).__name__ != "BinaryExpr"
+            or store_cond.cond.op != "=="
+            or getattr(store_cond.cond.left, "name", None) != "lane"
+            or getattr(store_cond.cond.right, "value", None) != 0
+            or store_cond.else_body
+            or len(store_cond.body) != 1
+        ):
+            raise NotImplementedError(
+                "Unsupported RMSNorm warp leader condition"
+            )
+
+        partial_write = store_cond.body[0]
+
+        if (
+            type(partial_write).__name__ != "Write"
+            or partial_write.output != smem.name
+            or names(partial_write.index) != ("warp",)
+            or tuple(partial_write.values) != (accum.name,)
+            or partial_write.atomic
+        ):
+            raise NotImplementedError(
+                "Unsupported RMSNorm shared-memory write"
+            )
+
+        args = {
+            arg["name"]: arg
+            for arg in self.kernel.metadata["selected_kernel"]["args"]
+        }
+
+        required_shapes = {
+            load_x.input: [rows, columns],
+            load_w.input: [columns],
+            count_load.input: [1],
+            epsilon_load.input: [1],
+            write.output: [rows, columns],
+        }
+
+        for buffer, shape in required_shapes.items():
+            if (
+                buffer not in args
+                or args[buffer]["dtype"] != "f32"
+                or args[buffer]["shape"] != shape
+                or buffer not in self.pointers
+            ):
+                raise NotImplementedError(
+                    f"Unsupported RMSNorm tensor: {buffer}"
+                )
+
+        # --------------------------------------------------
+        # 1. Block-local thread and row indices
+        # --------------------------------------------------
+
+        tid = self.gen.register(".u32")
+        row = self.gen.register(".u32")
+
+        self._emit(f"mov.u32 {tid}, %tid.x;")
+        self._emit(f"mov.u32 {row}, %ctaid.x;")
+
+        self.axes[thread_axis.name] = tid
+        self.axes[row_axis.name] = row
+
+        # Four warp partials. Slot zero will later
+        # contain the inverse RMS factor.
+        self.gen.shared(
+            smem.name, ".f32", length=warps, align=4
+        )
+
+        # --------------------------------------------------
+        # 2. First loop: accumulate x * x
+        # --------------------------------------------------
+
+        col = self.gen.register(".u32")
+        acc = self.gen.register(".f32")
+
+        self._emit(f"mov.u32 {col}, {tid};")
+        self._emit(f"mov.f32 {acc}, 0f00000000;")
+
+        loop_start = self._new_label()
+        loop_end = self._new_label()
+        stop = self.gen.register(".pred")
+
+        self.gen.label(loop_start)
+        self._emit(
+            f"setp.ge.u32 {stop}, {col}, {columns};"
+        )
+        self._emit(f"@{stop} bra {loop_end};")
+
+        linear = self.gen.register(".u32")
+        self._emit(
+            f"mad.lo.u32 {linear}, {row}, {columns}, {col};"
+        )
+
+        x_address = self._buffer_address(load_x.input, linear)
+
+        value = self.gen.register(".f32")
+        squared = self.gen.register(".f32")
+
+        self._emit(
+            self.iset.load(
+                "global", ".f32", value, f"[{x_address}]"
+            )
+        )
+        self._emit(
+            self.iset.mul(".f32", squared, value, value)
+        )
+        self._emit(
+            self.iset.add(".f32", acc, acc, squared)
+        )
+        self._emit(f"add.u32 {col}, {col}, {threads};")
+        self._emit(f"bra {loop_start};")
+        self.gen.label(loop_end)
+
+        # --------------------------------------------------
+        # 3. Warp butterfly reduction
+        # --------------------------------------------------
+
+        bits = self.gen.register(".b32")
+        other_bits = self.gen.register(".b32")
+        other = self.gen.register(".f32")
+
+        for mask in (16, 8, 4, 2, 1):
+            self._emit(f"mov.b32 {bits}, {acc};")
+            self._emit(
+                f"shfl.sync.bfly.b32 {other_bits}, "
+                f"{bits}, {mask}, 0x1f, 0xffffffff;"
+            )
+            self._emit(f"mov.b32 {other}, {other_bits};")
+            self._emit(
+                self.iset.add(".f32", acc, acc, other)
+            )
+
+        # --------------------------------------------------
+        # 4. Warp leaders publish their partial sums
+        # --------------------------------------------------
+
+        lane = self.gen.register(".u32")
+        warp = self.gen.register(".u32")
+        shared_base = self.gen.register(".u32")
+
+        self._emit(f"and.b32 {lane}, {tid}, 31;")
+        self._emit(f"shr.u32 {warp}, {tid}, 5;")
+        self._emit(f"mov.u32 {shared_base}, {smem.name};")
+
+        skip_store = self._new_label()
+        not_leader = self.gen.register(".pred")
+
+        self._emit(
+            f"setp.ne.u32 {not_leader}, {lane}, 0;"
+        )
+        self._emit(f"@{not_leader} bra {skip_store};")
+
+        offset = self.gen.register(".u32")
+        shared_address = self.gen.register(".u32")
+
+        self._emit(f"shl.b32 {offset}, {warp}, 2;")
+        self._emit(
+            f"add.u32 {shared_address}, "
+            f"{shared_base}, {offset};"
+        )
+        self._emit(
+            f"st.shared.f32 [{shared_address}], {acc};"
+        )
+
+        self.gen.label(skip_store)
+        self._emit("bar.sync 0;")
+
+        # --------------------------------------------------
+        # 5. Thread zero computes the inverse RMS factor
+        # --------------------------------------------------
+
+        skip_combine = self._new_label()
+        not_zero = self.gen.register(".pred")
+
+        self._emit(f"setp.ne.u32 {not_zero}, {tid}, 0;")
+        self._emit(f"@{not_zero} bra {skip_combine};")
+
+        partials = []
+
+        for i in range(warps):
+            part = self.gen.register(".f32")
+            byte_offset = f"+{i * 4}" if i else ""
+
+            self._emit(
+                f"ld.shared.f32 {part}, "
+                f"[{shared_base}{byte_offset}];"
+            )
+            partials.append(part)
+
+        while len(partials) > 1:
+            next_level = []
+
+            for i in range(0, len(partials), 2):
+                dst = self.gen.register(".f32")
+                self._emit(
+                    self.iset.add(
+                        ".f32",
+                        dst,
+                        partials[i],
+                        partials[i + 1],
+                    )
+                )
+                next_level.append(dst)
+
+            partials = next_level
+
+        reduced_sum = partials[0]
+
+        # Load mean_count[0] and add_c1[0]
+        count = self.gen.register(".f32")
+        epsilon = self.gen.register(".f32")
+
+        self._emit(
+            self.iset.load(
+                "global", ".f32", count,
+                f"[{self.pointers[count_load.input]}]"
+            )
+        )
+        self._emit(
+            self.iset.load(
+                "global", ".f32", epsilon,
+                f"[{self.pointers[epsilon_load.input]}]"
+            )
+        )
+
+        reciprocal = self.gen.register(".f32")
+        mean_square = self.gen.register(".f32")
+        stabilized = self.gen.register(".f32")
+        root = self.gen.register(".f32")
+        inverse_rms = self.gen.register(".f32")
+
+        self._emit(
+            f"div.rn.f32 {reciprocal}, "
+            f"0f3f800000, {count};"
+        )
+        self._emit(
+            self.iset.mul(
+                ".f32",
+                mean_square,
+                reduced_sum,
+                reciprocal,
+            )
+        )
+        self._emit(
+            self.iset.add(
+                ".f32",
+                stabilized,
+                epsilon,
+                mean_square,
+            )
+        )
+        self._emit(
+            f"sqrt.rn.f32 {root}, {stabilized};"
+        )
+        self._emit(
+            f"div.rn.f32 {inverse_rms}, "
+            f"0f3f800000, {root};"
+        )
+
+        # Publish the normalization factor to other threads.
+        self._emit(
+            f"st.shared.f32 [{shared_base}], {inverse_rms};"
+        )
+
+        self.gen.label(skip_combine)
+
+        # This barrier is essential. Without it, other threads
+        # could read a stale warp partial instead of inverse_rms.
+        self._emit("bar.sync 0;")
+
+        factor = self.gen.register(".f32")
+        self._emit(
+            f"ld.shared.f32 {factor}, [{shared_base}];"
+        )
+
+        # --------------------------------------------------
+        # 6. Second loop: output = weight * (x * factor)
+        # --------------------------------------------------
+
+        out_col = self.gen.register(".u32")
+        self._emit(f"mov.u32 {out_col}, {tid};")
+
+        output_start = self._new_label()
+        output_end = self._new_label()
+        stop_out = self.gen.register(".pred")
+
+        self.gen.label(output_start)
+        self._emit(
+            f"setp.ge.u32 {stop_out}, {out_col}, {columns};"
+        )
+        self._emit(f"@{stop_out} bra {output_end};")
+
+        out_linear = self.gen.register(".u32")
+
+        self._emit(
+            f"mad.lo.u32 {out_linear}, "
+            f"{row}, {columns}, {out_col};"
+        )
+
+        x_addr = self._buffer_address(
+            out_x.input, out_linear
+        )
+        w_addr = self._buffer_address(
+            load_w.input, out_col
+        )
+        y_addr = self._buffer_address(
+            write.output, out_linear
+        )
+
+        x_value = self.gen.register(".f32")
+        w_value = self.gen.register(".f32")
+        scaled = self.gen.register(".f32")
+        weighted = self.gen.register(".f32")
+
+        self._emit(
+            self.iset.load(
+                "global", ".f32", x_value, f"[{x_addr}]"
+            )
+        )
+        self._emit(
+            self.iset.mul(
+                ".f32", scaled, x_value, factor
+            )
+        )
+        self._emit(
+            self.iset.load(
+                "global", ".f32", w_value, f"[{w_addr}]"
+            )
+        )
+        self._emit(
+            self.iset.mul(
+                ".f32", weighted, w_value, scaled
+            )
+        )
+        self._emit(
+            self.iset.store(
+                "global", ".f32",
+                f"[{y_addr}]", weighted
+            )
+        )
+
+        self._emit(
+            f"add.u32 {out_col}, {out_col}, {threads};"
+        )
+        self._emit(f"bra {output_start};")
+
+        self.gen.label(output_end)
+
     def lower(self):
         """Lower supported Emmy Kernel IR into a PTX entry."""
 
@@ -3490,6 +4019,14 @@ class EmmyIRLowering:
                     for stmt in root.body
                 )
 
+                rmsnorm_pattern = (
+                    "StridedLoop", "WarpShuffle", "Smem",
+                    "Cond", "Sync", "TreeHalve",
+                    "Load", "Assign", "Assign",
+                    "Load", "Assign", "Assign", "Assign",
+                    "StridedLoop",
+                )
+
                 l2_pattern = (
                     "StridedLoop",
                     "WarpShuffle",
@@ -3502,16 +4039,26 @@ class EmmyIRLowering:
                     "StridedLoop",
                 )
 
+                # 1. Weighted RMSNorm
+                if kinds == rmsnorm_pattern:
+                    self._lower_rmsnorm(root)
+                    return self.gen.render_entry()
+
+                # 2. L2 normalization
                 if kinds == l2_pattern:
                     self._lower_l2norm(root)
                     return self.gen.render_entry()
 
+                # 3. Scalar/row reductions
                 if "StridedLoop" in kinds:
                     self._lower_sum_reduction(root)
                     return self.gen.render_entry()
 
+        # 4. IMPORTANT: preserve existing pointwise lowering.
         self._body(self.kernel.body)
+
         return self.gen.render_entry()
+
 
 class PTXEmitter:
     def __init__(self):
