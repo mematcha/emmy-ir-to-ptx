@@ -4005,8 +4005,606 @@ class EmmyIRLowering:
 
         self.gen.label(output_end)
 
+    def _lower_softmax(self, tile):
+        """Lower the supported online-softmax IR using stable passes.
+
+        One CUDA block per row, 128 threads per block.
+        Supported: contiguous row-major f32 matrices.
+        """
+
+        stmts = tuple(tile.body)
+        kinds = tuple(type(s).__name__ for s in stmts)
+
+        expected = (
+            "StridedLoop", "WarpShuffle",
+            "Smem", "Smem", "Cond", "Sync",
+            "TreeHalve", "Assign", "StridedLoop",
+        )
+
+        if kinds != expected or len(tile.axes) != 2:
+            raise NotImplementedError(
+                f"Unsupported softmax structure: {kinds}"
+            )
+
+        (
+            online_loop, shuffle, max_smem, sum_smem,
+            partial_store, sync, tree, reciprocal, output_loop,
+        ) = stmts
+
+        row_axis, thread_axis = tile.axes
+
+        def extent(axis):
+            return getattr(axis.extent, "value", axis.extent)
+
+        def operation(stmt):
+            return self._operation_name(stmt.op).lower()
+
+        def index_names(index):
+            return tuple(
+                getattr(expr, "name", None)
+                for expr in index
+            )
+
+        rows = extent(row_axis)
+        threads = extent(thread_axis)
+        columns = extent(online_loop.axis)
+
+        if (
+            not all(
+                type(n) is int and n > 0
+                for n in (rows, threads, columns)
+            )
+            or threads != 128
+            or extent(output_loop.axis) != columns
+            or tuple(self.kernel.launch["grid"])
+                != (rows, 1, 1)
+            or tuple(self.kernel.launch["block"])
+                != (threads, 1, 1)
+        ):
+            raise NotImplementedError(
+                "Unsupported softmax launch geometry"
+            )
+
+        def valid_loop(loop):
+            return (
+                loop.end is None
+                and loop.seed
+                and getattr(loop.start, "name", None)
+                    == thread_axis.name
+                and type(loop.step).__name__ == "Literal"
+                and loop.step.value == threads
+            )
+
+        if not valid_loop(online_loop) or not valid_loop(output_loop):
+            raise NotImplementedError(
+                "Unsupported softmax loop indexing"
+            )
+
+        first_body = tuple(online_loop.body)
+        final_body = tuple(output_loop.body)
+
+        first_kinds = tuple(
+            type(s).__name__ for s in first_body
+        )
+
+        final_kinds = tuple(
+            type(s).__name__ for s in final_body
+        )
+
+        if first_kinds != (
+            "Let", "Load",
+            "Assign", "Assign", "Assign", "Assign",
+            "Assign", "Assign", "Assign", 
+            "Accum", "Accum",
+        ):
+            raise NotImplementedError(
+                f"Unsupported online softmax body: {first_kinds}"
+            )
+
+        if final_kinds != (
+            "Load", "Assign", "Assign", "Assign", "Write"
+        ):
+            raise NotImplementedError(
+                f"Unsupported softmax output body: {final_kinds}"
+            )
+
+        (
+            one, input_load,
+            running_max, old_delta, old_exp,
+            new_delta, new_exp, scaled_sum,
+            new_term, 
+            sum_accum, max_accum,
+        ) = first_body
+
+        # Some Emmy versions may order the online-softmax
+        # assignments differently. Validate the actual IR
+        # rather than guessing how to translate it.
+        if (
+            getattr(one, "name", None) != "one"
+            or getattr(getattr(one, "value", None), "value", None)
+                != 1.0
+            or operation(running_max) != "maximum"
+            or operation(old_delta) != "subtract"
+            or operation(old_exp) != "exp"
+            or operation(new_delta) != "subtract"
+            or operation(new_exp) != "exp"
+            or operation(scaled_sum) != "multiply"
+            or operation(new_term) != "multiply"
+            or operation(sum_accum) != "add"
+            or operation(max_accum) != "maximum"
+        ):
+            raise NotImplementedError(
+                "Unsupported online softmax arithmetic"
+            )
+
+        # Check the accumulator dependencies. This ensures
+        # our stable-pass replacement is semantically valid.
+        if (
+            tuple(running_max.args)
+                != (max_accum.name, input_load.names[0])
+            or tuple(old_delta.args)
+                != (max_accum.name, running_max.name)
+            or tuple(old_exp.args) != (old_delta.name,)
+            or tuple(new_delta.args)
+                != (input_load.names[0], running_max.name)
+            or tuple(new_exp.args) != (new_delta.name,)
+            or tuple(scaled_sum.args)
+                != (sum_accum.name, old_exp.name)
+            or tuple(new_term.args)
+                != (new_exp.name, one.name)
+            or sum_accum.base != scaled_sum.name
+            or sum_accum.value != new_term.name
+            or max_accum.value != input_load.names[0]
+        ):
+            raise NotImplementedError(
+                "Unsupported online softmax dependencies"
+            )
+
+        out_load, subtract, exp_stmt, multiply, write = final_body
+
+        if (
+            len(input_load.names) != 1
+            or len(out_load.names) != 1
+            or input_load.dtype.name != "f32"
+            or out_load.dtype.name != "f32"
+            or input_load.input != out_load.input
+            or index_names(input_load.index)
+                != (row_axis.name, online_loop.axis.name)
+            or index_names(out_load.index)
+                != (row_axis.name, output_loop.axis.name)
+            or index_names(write.index)
+                != (row_axis.name, output_loop.axis.name)
+            or operation(reciprocal) != "reciprocal"
+            or tuple(reciprocal.args) != (sum_accum.name,)
+            or operation(subtract) != "subtract"
+            or tuple(subtract.args)
+                != (out_load.names[0], max_accum.name)
+            or operation(exp_stmt) != "exp"
+            or tuple(exp_stmt.args) != (subtract.name,)
+            or operation(multiply) != "multiply"
+            or tuple(multiply.args)
+                != (reciprocal.name, exp_stmt.name)
+            or tuple(write.values) != (multiply.name,)
+            or write.atomic
+        ):
+            raise NotImplementedError(
+                "Unsupported softmax output expressions"
+            )
+
+        warps = threads // 32
+
+        if (
+            shuffle.length != 32
+            or tuple(shuffle.state)
+                != (max_accum.name, sum_accum.name)
+            or tuple(tree.state)
+                != (max_accum.name, sum_accum.name)
+            or tuple(tree.bufs)
+                != (max_smem.name, sum_smem.name)
+            or tree.length != warps
+            or tuple(max_smem.extents) != (warps,)
+            or tuple(sum_smem.extents) != (warps,)
+            or max_smem.dtype != "float"
+            or sum_smem.dtype != "float"
+            or sync.warp
+            or sync.barrier_id != 0
+        ):
+            raise NotImplementedError(
+                "Unsupported softmax reduction layout"
+            )
+
+        if (
+            getattr(partial_store.cond, "op", None) != "=="
+            or getattr(partial_store.cond.left, "name", None)
+                != "lane"
+            or getattr(partial_store.cond.right, "value", None)
+                != 0
+            or partial_store.else_body
+            or len(partial_store.body) != 2
+            or tuple(
+                getattr(s, "output", None)
+                for s in partial_store.body
+            ) != (max_smem.name, sum_smem.name)
+            or tuple(
+                tuple(s.values) for s in partial_store.body
+            ) != ((max_accum.name,), (sum_accum.name,))
+        ):
+            raise NotImplementedError(
+                "Unsupported softmax warp partial writes"
+            )
+
+        # The two accumulator pairs use max, subtract, exp,
+        # multiply, add, and copy to merge running softmax
+        # states across lanes and warps.
+        merge_ops = (
+            "maximum", "subtract", "exp", "subtract",
+            "exp", "multiply", "multiply", "add", "copy",
+        )
+
+        for merge in (shuffle, tree):
+            if tuple(
+                operation(s) for s in merge.combine_states
+            ) != merge_ops:
+                raise NotImplementedError(
+                    "Unsupported online softmax merge"
+                )
+
+        args = {
+            a["name"]: a
+            for a in self.kernel.metadata["selected_kernel"]["args"]
+        }
+
+        for name in (input_load.input, write.output):
+            if (
+                name not in args
+                or args[name]["dtype"] != "f32"
+                or args[name]["shape"] != [rows, columns]
+                or name not in self.pointers
+            ):
+                raise NotImplementedError(
+                    f"Unsupported softmax tensor: {name}"
+                )
+
+        # -----------------------------------------------
+        # CUDA block-local coordinates and shared arrays
+        # -----------------------------------------------
+
+        tid = self.gen.register(".u32")
+        row = self.gen.register(".u32")
+
+        self._emit(f"mov.u32 {tid}, %tid.x;")
+        self._emit(f"mov.u32 {row}, %ctaid.x;")
+
+        self.axes[thread_axis.name] = tid
+        self.axes[row_axis.name] = row
+
+        self.gen.shared(
+            max_smem.name, ".f32", length=warps, align=4
+        )
+        self.gen.shared(
+            sum_smem.name, ".f32", length=warps, align=4
+        )
+
+        # Convert a natural exponential using:
+        # exp(x) = 2 ** (x * log2(e)).
+        #
+        # PTX has ex2.approx.f32, not exp.f32.
+        def emit_exp(dst, src):
+            exponent = self.gen.register(".f32")
+            self._emit(
+                f"mul.f32 {exponent}, "
+                f"{src}, 0f3fb8aa3b;"
+            )
+            self._emit(
+                f"ex2.approx.f32 {dst}, {exponent};"
+            )
+
+        # -----------------------------------------------
+        # Cooperative reduction helper:
+        # max or sum across all 128 threads.
+        # -----------------------------------------------
+
+        def reduce_row(mode, shared_name, previous_max=None):
+            if mode not in ("max", "sum"):
+                raise ValueError("Unsupported reduction mode")
+
+            col = self.gen.register(".u32")
+            acc = self.gen.register(".f32")
+
+            self._emit(f"mov.u32 {col}, {tid};")
+
+            if mode == "max":
+                self._emit(
+                    f"mov.f32 {acc}, 0fff800000;"
+                )
+            else:
+                self._emit(
+                    f"mov.f32 {acc}, 0f00000000;"
+                )
+
+            start = self._new_label()
+            end = self._new_label()
+            stop = self.gen.register(".pred")
+
+            self.gen.label(start)
+
+            self._emit(
+                f"setp.ge.u32 {stop}, {col}, {columns};"
+            )
+            self._emit(f"@{stop} bra {end};")
+
+            linear = self.gen.register(".u32")
+            self._emit(
+                f"mad.lo.u32 {linear}, "
+                f"{row}, {columns}, {col};"
+            )
+
+            address = self._buffer_address(
+                input_load.input, linear
+            )
+
+            value = self.gen.register(".f32")
+            self._emit(
+                self.iset.load(
+                    "global", ".f32", value,
+                    f"[{address}]"
+                )
+            )
+
+            if mode == "max":
+                self._emit(
+                    f"max.f32 {acc}, {acc}, {value};"
+                )
+            else:
+                delta = self.gen.register(".f32")
+                exp_value = self.gen.register(".f32")
+
+                self._emit(
+                    f"sub.f32 {delta}, "
+                    f"{value}, {previous_max};"
+                )
+                emit_exp(exp_value, delta)
+
+                self._emit(
+                    self.iset.add(
+                        ".f32", acc, acc, exp_value
+                    )
+                )
+
+            self._emit(
+                f"add.u32 {col}, {col}, {threads};"
+            )
+            self._emit(f"bra {start};")
+
+            self.gen.label(end)
+
+            # Warp-level butterfly reduction.
+            bits = self.gen.register(".b32")
+            shuffled_bits = self.gen.register(".b32")
+            other = self.gen.register(".f32")
+
+            for mask in (16, 8, 4, 2, 1):
+                self._emit(f"mov.b32 {bits}, {acc};")
+                self._emit(
+                    f"shfl.sync.bfly.b32 {shuffled_bits}, "
+                    f"{bits}, {mask}, 0x1f, 0xffffffff;"
+                )
+                self._emit(
+                    f"mov.b32 {other}, {shuffled_bits};"
+                )
+
+                if mode == "max":
+                    self._emit(
+                        f"max.f32 {acc}, {acc}, {other};"
+                    )
+                else:
+                    self._emit(
+                        self.iset.add(
+                            ".f32", acc, acc, other
+                        )
+                    )
+
+            # One partial reduction per warp.
+            lane = self.gen.register(".u32")
+            warp = self.gen.register(".u32")
+            shared_base = self.gen.register(".u32")
+
+            self._emit(f"and.b32 {lane}, {tid}, 31;")
+            self._emit(f"shr.u32 {warp}, {tid}, 5;")
+            self._emit(
+                f"mov.u32 {shared_base}, {shared_name};"
+            )
+
+            skip_store = self._new_label()
+            not_leader = self.gen.register(".pred")
+
+            self._emit(
+                f"setp.ne.u32 {not_leader}, {lane}, 0;"
+            )
+            self._emit(
+                f"@{not_leader} bra {skip_store};"
+            )
+
+            offset = self.gen.register(".u32")
+            shared_address = self.gen.register(".u32")
+
+            self._emit(
+                f"shl.b32 {offset}, {warp}, 2;"
+            )
+            self._emit(
+                f"add.u32 {shared_address}, "
+                f"{shared_base}, {offset};"
+            )
+            self._emit(
+                f"st.shared.f32 [{shared_address}], {acc};"
+            )
+
+            self.gen.label(skip_store)
+
+            # All warp partials are now ready.
+            self._emit("bar.sync 0;")
+
+            skip_combine = self._new_label()
+            not_zero = self.gen.register(".pred")
+
+            self._emit(
+                f"setp.ne.u32 {not_zero}, {tid}, 0;"
+            )
+            self._emit(
+                f"@{not_zero} bra {skip_combine};"
+            )
+
+            partials = []
+
+            for i in range(warps):
+                part = self.gen.register(".f32")
+                byte_offset = f"+{i * 4}" if i else ""
+
+                self._emit(
+                    f"ld.shared.f32 {part}, "
+                    f"[{shared_base}{byte_offset}];"
+                )
+                partials.append(part)
+
+            # Balanced cross-warp reduction in thread zero.
+            while len(partials) > 1:
+                next_level = []
+
+                for i in range(0, len(partials), 2):
+                    combined = self.gen.register(".f32")
+
+                    if mode == "max":
+                        self._emit(
+                            f"max.f32 {combined}, "
+                            f"{partials[i]}, {partials[i + 1]};"
+                        )
+                    else:
+                        self._emit(
+                            self.iset.add(
+                                ".f32", combined,
+                                partials[i], partials[i + 1]
+                            )
+                        )
+
+                    next_level.append(combined)
+
+                partials = next_level
+
+            # Replace shared slot zero with the final result.
+            self._emit(
+                f"st.shared.f32 "
+                f"[{shared_base}], {partials[0]};"
+            )
+
+            self.gen.label(skip_combine)
+
+            # Broadcast the final result to every thread.
+            self._emit("bar.sync 0;")
+
+            result = self.gen.register(".f32")
+            self._emit(
+                f"ld.shared.f32 {result}, "
+                f"[{shared_base}];"
+            )
+
+            return result
+
+        # -----------------------------------------------
+        # Pass 1: maximum of the row
+        # -----------------------------------------------
+
+        row_max = reduce_row("max", max_smem.name)
+
+        # -----------------------------------------------
+        # Pass 2: sum(exp(x - row_max))
+        # -----------------------------------------------
+
+        row_sum = reduce_row(
+            "sum", sum_smem.name, previous_max=row_max
+        )
+
+        inv_sum = self.gen.register(".f32")
+
+        self._emit(
+            f"div.rn.f32 {inv_sum}, "
+            f"0f3f800000, {row_sum};"
+        )
+
+        # -----------------------------------------------
+        # Pass 3: normalized output
+        # -----------------------------------------------
+
+        out_col = self.gen.register(".u32")
+        self._emit(f"mov.u32 {out_col}, {tid};")
+
+        output_start = self._new_label()
+        output_end = self._new_label()
+        output_stop = self.gen.register(".pred")
+
+        self.gen.label(output_start)
+
+        self._emit(
+            f"setp.ge.u32 {output_stop}, "
+            f"{out_col}, {columns};"
+        )
+        self._emit(
+            f"@{output_stop} bra {output_end};"
+        )
+
+        output_linear = self.gen.register(".u32")
+
+        self._emit(
+            f"mad.lo.u32 {output_linear}, "
+            f"{row}, {columns}, {out_col};"
+        )
+
+        input_address = self._buffer_address(
+            out_load.input, output_linear
+        )
+
+        output_address = self._buffer_address(
+            write.output, output_linear
+        )
+
+        value = self.gen.register(".f32")
+        delta = self.gen.register(".f32")
+        exponential = self.gen.register(".f32")
+        normalized = self.gen.register(".f32")
+
+        self._emit(
+            self.iset.load(
+                "global", ".f32", value,
+                f"[{input_address}]"
+            )
+        )
+        self._emit(
+            f"sub.f32 {delta}, {value}, {row_max};"
+        )
+        emit_exp(exponential, delta)
+
+        self._emit(
+            self.iset.mul(
+                ".f32", normalized, inv_sum, exponential
+            )
+        )
+
+        self._emit(
+            self.iset.store(
+                "global", ".f32",
+                f"[{output_address}]", normalized
+            )
+        )
+
+        self._emit(
+            f"add.u32 {out_col}, {out_col}, {threads};"
+        )
+        self._emit(f"bra {output_start};")
+
+        self.gen.label(output_end)
+
+    
     def lower(self):
-        """Lower supported Emmy Kernel IR into a PTX entry."""
+        """Lower supported Emmy Kernel IR into PTX."""
 
         self._prologue()
 
@@ -4019,6 +4617,12 @@ class EmmyIRLowering:
                     for stmt in root.body
                 )
 
+                softmax_pattern = (
+                    "StridedLoop", "WarpShuffle",
+                    "Smem", "Smem", "Cond", "Sync",
+                    "TreeHalve", "Assign", "StridedLoop",
+                )
+
                 rmsnorm_pattern = (
                     "StridedLoop", "WarpShuffle", "Smem",
                     "Cond", "Sync", "TreeHalve",
@@ -4028,36 +4632,36 @@ class EmmyIRLowering:
                 )
 
                 l2_pattern = (
-                    "StridedLoop",
-                    "WarpShuffle",
-                    "Smem",
-                    "Cond",
-                    "Sync",
-                    "TreeHalve",
-                    "Assign",
-                    "Assign",
-                    "StridedLoop",
+                    "StridedLoop", "WarpShuffle",
+                    "Smem", "Cond", "Sync",
+                    "TreeHalve", "Assign",
+                    "Assign", "StridedLoop",
                 )
 
-                # 1. Weighted RMSNorm
+                # 1. Row softmax
+                if kinds == softmax_pattern:
+                    self._lower_softmax(root)
+                    return self.gen.render_entry()
+
+                # 2. RMSNorm
                 if kinds == rmsnorm_pattern:
                     self._lower_rmsnorm(root)
                     return self.gen.render_entry()
 
-                # 2. L2 normalization
+                # 3. L2Norm
                 if kinds == l2_pattern:
                     self._lower_l2norm(root)
                     return self.gen.render_entry()
 
-                # 3. Scalar/row reductions
+                # 4. Scalar and row reductions
                 if "StridedLoop" in kinds:
                     self._lower_sum_reduction(root)
                     return self.gen.render_entry()
 
-        # 4. IMPORTANT: preserve existing pointwise lowering.
+        # 5. Existing pointwise kernels
         self._body(self.kernel.body)
-
         return self.gen.render_entry()
+
 
 
 class PTXEmitter:
