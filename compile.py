@@ -2088,6 +2088,16 @@ class EmmyIRLowering:
 
         self._label_counter = 0
 
+        # State used by the general multi-axis lowering path.
+        self.carried = set()        # names declared by Init (updated in place)
+        self.smem = {}              # shared array -> {"base", "dims"}
+        self.module_decls = []      # module-scope declarations (dynamic smem)
+        self._live_inits = set()    # accumulators seeded by an enclosing loop
+        self._smem_pool_used = 0
+        self._smem_dynamic = False
+        self.tid = None
+        self.bid = None
+
     def _new_label(self):
         self._label_counter += 1
         return f"L_pointwise_end_{self._label_counter}"
@@ -2245,7 +2255,11 @@ class EmmyIRLowering:
                     f"Undefined elementwise input: {name}"
                 )
 
-        dst = self.gen.register(".f32")
+        # An Init-declared name is carried state: update it in place.
+        if stmt.name in self.carried and stmt.name in self.values:
+            dst = self.values[stmt.name]
+        else:
+            dst = self.gen.register(".f32")
 
         # -----------------------------
         # Unary operations
@@ -2253,7 +2267,25 @@ class EmmyIRLowering:
         if len(args) == 1:
             src = self.values[args[0]]
 
-            if op in ("relu", "relu_", "positive"):
+            if op in ("exp", "exponential"):
+                # exp(x) = 2 ** (x * log2(e)); PTX has ex2, not exp.
+                scaled = self.gen.register(".f32")
+                self._emit(f"mul.f32 {scaled}, {src}, 0f3fb8aa3b;")
+                self._emit(f"ex2.approx.f32 {dst}, {scaled};")
+
+            elif op in ("reciprocal", "recip"):
+                self._emit(f"rcp.rn.f32 {dst}, {src};")
+
+            elif op in ("log", "ln"):
+                # ln(x) = log2(x) * ln(2)
+                scaled = self.gen.register(".f32")
+                self._emit(f"lg2.approx.f32 {scaled}, {src};")
+                self._emit(f"mul.f32 {dst}, {scaled}, 0f3f317218;")
+
+            elif op in ("square", "sqr"):
+                self._emit(f"mul.f32 {dst}, {src}, {src};")
+
+            elif op in ("relu", "relu_", "positive"):
                 self._emit(
                     f"max.f32 {dst}, {src}, 0f00000000;"
                 )
@@ -4602,7 +4634,729 @@ class EmmyIRLowering:
 
         self.gen.label(output_end)
 
-    
+    # ==================================================================
+    # General multi-axis lowering (matmul and attention-style kernels)
+    #
+    # Walks the statement list in order, one translation per statement
+    # kind. Index expressions evaluate to either a Python int (constant
+    # folded) or a u32 register; predicates are .pred registers.
+    # ==================================================================
+
+    _GENERAL_KINDS = frozenset({
+        "Load", "Assign", "Let", "Init", "Accum", "Loop", "StridedLoop",
+        "Cond", "Sync", "Smem", "CpAsyncCopy", "CpAsyncCommit",
+        "CpAsyncWait", "Write",
+    })
+
+    _MAX_UNROLL = 64
+    _MAX_UNROLL_STATEMENTS = 1024
+
+    @staticmethod
+    def _f32_imm(value):
+        """PTX hex float literal for an f32 value (handles +-inf)."""
+        bits = struct.unpack(">I", struct.pack(">f", float(value)))[0]
+        return f"0f{bits:08X}"
+
+    @staticmethod
+    def _is_pred(value):
+        return isinstance(value, str) and value.startswith("%p")
+
+    @staticmethod
+    def _imm(value):
+        return str(value & 0xFFFFFFFF)
+
+    def _greg(self, value):
+        """Materialize an int or register result into a u32 register."""
+        if isinstance(value, int):
+            reg = self.gen.register(".u32")
+            self._emit(f"mov.u32 {reg}, {self._imm(value)};")
+            return reg
+        return value
+
+    def _gpred(self, value):
+        """Convert an int/u32/pred expression result to a pred (or bool)."""
+        if isinstance(value, int):
+            return bool(value)
+        if self._is_pred(value):
+            return value
+        pred = self.gen.register(".pred")
+        self._emit(f"setp.ne.u32 {pred}, {value}, 0;")
+        return pred
+
+    def _garith(self, op, left, right):
+        """Integer arithmetic over ints/registers with constant folding."""
+        if isinstance(left, int) and isinstance(right, int):
+            if op == "+":
+                return left + right
+            if op == "-":
+                return left - right
+            if op == "*":
+                return left * right
+            if op == "/":
+                return left // right
+            if op == "%":
+                return left % right
+            if op == "&":
+                return left & right
+            if op == "|":
+                return left | right
+            if op == "^":
+                return left ^ right
+            if op == "<<":
+                return left << right
+            if op == ">>":
+                return left >> right
+            raise NotImplementedError(f"Index operator: {op}")
+
+        if self._is_pred(left) or self._is_pred(right):
+            raise NotImplementedError(
+                f"Arithmetic operator {op} applied to a predicate"
+            )
+
+        if op in ("+", "*", "&", "|", "^") and isinstance(left, int):
+            left, right = right, left
+
+        if op in ("+", "-", "|", "^", "<<", ">>") and right == 0:
+            return left
+        if op == "*" and isinstance(right, int):
+            if right == 0:
+                return 0
+            if right == 1:
+                return left
+        if op == "/" and right == 1:
+            return left
+        if op == "%" and right == 1:
+            return 0
+
+        mnemonic = {
+            "+": "add.u32",
+            "-": "sub.u32",
+            "*": "mul.lo.u32",
+            "/": "div.u32",
+            "%": "rem.u32",
+            "&": "and.b32",
+            "|": "or.b32",
+            "^": "xor.b32",
+            "<<": "shl.b32",
+            ">>": "shr.u32",
+        }.get(op)
+
+        if mnemonic is None:
+            raise NotImplementedError(f"Index operator: {op}")
+
+        left = self._greg(left)
+        right = self._imm(right) if isinstance(right, int) else right
+        dst = self.gen.register(".u32")
+        self._emit(f"{mnemonic} {dst}, {left}, {right};")
+        return dst
+
+    def _gcompare(self, op, left, right):
+        names = {"<": "lt", "<=": "le", ">": "gt", ">=": "ge",
+                 "==": "eq", "!=": "ne"}
+
+        if isinstance(left, int) and isinstance(right, int):
+            return int({
+                "<": left < right, "<=": left <= right,
+                ">": left > right, ">=": left >= right,
+                "==": left == right, "!=": left != right,
+            }[op])
+
+        left = self._greg(left)
+        right = self._imm(right) if isinstance(right, int) else right
+        pred = self.gen.register(".pred")
+        self._emit(f"setp.{names[op]}.u32 {pred}, {left}, {right};")
+        return pred
+
+    def _glogic(self, op, left, right):
+        left = self._gpred(left)
+        right = self._gpred(right)
+
+        if isinstance(left, bool) or isinstance(right, bool):
+            if op == "&&":
+                if left is False or right is False:
+                    return 0
+                return right if isinstance(left, bool) else left
+            if left is True or right is True:
+                return 1
+            return right if isinstance(left, bool) else left
+
+        pred = self.gen.register(".pred")
+        mnemonic = "and.pred" if op == "&&" else "or.pred"
+        self._emit(f"{mnemonic} {pred}, {left}, {right};")
+        return pred
+
+    def _gexpr(self, expr):
+        """Lower an index/predicate expression to an int or register."""
+        kind = type(expr).__name__
+
+        if kind == "Literal":
+            value = expr.value
+            if isinstance(value, bool):
+                return int(value)
+            if type(value) is int:
+                return value
+            raise NotImplementedError(
+                f"Non-integer literal in index expression: {value!r}"
+            )
+
+        if kind == "Var":
+            if expr.name in self.axes:
+                return self.axes[expr.name]
+            raise NotImplementedError(
+                f"Unknown index variable: {expr.name}"
+            )
+
+        if kind == "Builtin":
+            if expr.name == "threadIdx.x":
+                return self.tid
+            if expr.name == "blockIdx.x":
+                return self.bid
+            raise NotImplementedError(f"Builtin: {expr.name}")
+
+        if kind == "BinaryExpr":
+            op = expr.op
+            left = self._gexpr(expr.left)
+            right = self._gexpr(expr.right)
+
+            if op in ("<", "<=", ">", ">=", "==", "!="):
+                return self._gcompare(op, left, right)
+            if op in ("&&", "||"):
+                return self._glogic(op, left, right)
+            return self._garith(op, left, right)
+
+        if kind == "TernaryExpr":
+            cond = self._gpred(self._gexpr(expr.cond))
+            if isinstance(cond, bool):
+                return self._gexpr(
+                    expr.if_true if cond else expr.if_false
+                )
+
+            when_true = self._gexpr(expr.if_true)
+            when_false = self._gexpr(expr.if_false)
+
+            if (
+                isinstance(when_true, int)
+                and isinstance(when_false, int)
+                and when_true == when_false
+            ):
+                return when_true
+
+            dst = self.gen.register(".u32")
+            true_op = (
+                self._imm(when_true)
+                if isinstance(when_true, int) else when_true
+            )
+            false_op = (
+                self._imm(when_false)
+                if isinstance(when_false, int) else when_false
+            )
+            self._emit(
+                f"selp.u32 {dst}, {true_op}, {false_op}, {cond};"
+            )
+            return dst
+
+        raise NotImplementedError(f"Index expression: {kind}")
+
+    def _flatten(self, index, dims):
+        """Row-major flat element offset of a coordinate tuple."""
+        index = tuple(index)
+        dims = tuple(dims)
+
+        if len(index) == 0:
+            return 0
+
+        if len(index) != len(dims):
+            raise NotImplementedError(
+                f"Index rank {len(index)} does not match "
+                f"buffer rank {len(dims)}"
+            )
+
+        flat = self._gexpr(index[0])
+        for coord, dim in zip(index[1:], dims[1:]):
+            flat = self._garith("*", flat, dim)
+            flat = self._garith("+", flat, self._gexpr(coord))
+        return flat
+
+    def _buffer_space(self, name):
+        if name in self.smem:
+            return "shared", self.smem[name]["dims"]
+        if name in self.pointers:
+            return "global", self.shapes[name]
+        raise ValueError(f"Unknown buffer: {name}")
+
+    def _gmem_ref(self, space, name, flat):
+        """Return (base register, constant byte offset) for element flat."""
+        base = (
+            self.pointers[name] if space == "global"
+            else self.smem[name]["base"]
+        )
+
+        if isinstance(flat, int):
+            return base, 4 * flat
+
+        if space == "global":
+            offset = self.gen.register(".u64")
+            address = self.gen.register(".u64")
+            self._emit(f"mul.wide.u32 {offset}, {flat}, 4;")
+            self._emit(f"add.u64 {address}, {base}, {offset};")
+        else:
+            address = self.gen.register(".u32")
+            self._emit(f"mad.lo.u32 {address}, {flat}, 4, {base};")
+
+        return address, 0
+
+    @staticmethod
+    def _operand(base, offset):
+        return f"[{base}+{offset}]" if offset else f"[{base}]"
+
+    def _new_general_label(self, hint):
+        self._label_counter += 1
+        return f"L_{hint}_{self._label_counter}"
+
+    @staticmethod
+    def _dim_value(dim):
+        value = getattr(dim, "value", dim)
+        if type(value) is not int or value <= 0:
+            raise ValueError("Extents must be positive integers")
+        return value
+
+    def _walk(self, statements):
+        """Yield every statement in a body, descending into control flow."""
+        for stmt in statements:
+            yield stmt
+            kind = type(stmt).__name__
+            if kind in ("Loop", "StridedLoop"):
+                yield from self._walk(stmt.body)
+            elif kind == "Cond":
+                yield from self._walk(stmt.body)
+                yield from self._walk(stmt.else_body)
+
+    # --------------------------- statements ---------------------------
+
+    def _gload(self, stmt):
+        # Shared-memory loads carry no dtype; every shared array is f32.
+        if stmt.dtype is not None and stmt.dtype.name != "f32":
+            raise NotImplementedError("Only f32 loads supported")
+
+        space, dims = self._buffer_space(stmt.input)
+        flat = self._flatten(stmt.index, dims)
+        base, offset = self._gmem_ref(space, stmt.input, flat)
+
+        # A grouped load reads consecutive elements of the last axis.
+        for lane, name in enumerate(stmt.names):
+            reg = self.gen.register(".f32")
+            self._emit(
+                f"ld.{space}.f32 {reg}, "
+                f"{self._operand(base, offset + 4 * lane)};"
+            )
+            self.values[name] = reg
+
+    def _gwrite(self, stmt):
+        if stmt.value_dtype.name != "f32":
+            raise NotImplementedError("Only f32 writes supported")
+        if str(stmt.swizzle).upper() != "NONE":
+            raise NotImplementedError("Swizzled writes are not supported")
+
+        space, dims = self._buffer_space(stmt.output)
+
+        if stmt.atomic and space != "global":
+            raise NotImplementedError("Atomic writes require global memory")
+
+        flat = self._flatten(stmt.index, dims)
+        base, offset = self._gmem_ref(space, stmt.output, flat)
+
+        for lane, name in enumerate(stmt.values):
+            if name not in self.values:
+                raise ValueError(f"Write references undefined value: {name}")
+
+            target = self._operand(base, offset + 4 * lane)
+            value = self.values[name]
+
+            if stmt.atomic:
+                self._emit(f"red.global.add.f32 {target}, {value};")
+            else:
+                self._emit(f"st.{space}.f32 {target}, {value};")
+
+    def _glet(self, stmt):
+        dtype = stmt.dtype.name if stmt.dtype is not None else "f32"
+        value = stmt.value
+
+        if dtype == "f32":
+            if type(value).__name__ != "Literal":
+                raise NotImplementedError("Let f32 requires a literal")
+            reg = self.gen.register(".f32")
+            self._emit(f"mov.f32 {reg}, {self._f32_imm(value.value)};")
+            self.values[stmt.name] = reg
+            return
+
+        # Integer binding: a precomputed index usable in later expressions.
+        self.axes[stmt.name] = self._gexpr(value)
+
+    def _ginit(self, stmt):
+        if stmt.dtype.name != "f32":
+            raise NotImplementedError("Only f32 Init supported")
+        reg = self.gen.register(".f32")
+        self._emit(f"mov.f32 {reg}, {self._f32_imm(stmt.identity)};")
+        self.values[stmt.name] = reg
+        self.carried.add(stmt.name)
+
+    _ACCUM = {
+        "add": ("add.f32", 0.0),
+        "sum": ("add.f32", 0.0),
+        "multiply": ("mul.f32", 1.0),
+        "mul": ("mul.f32", 1.0),
+        "maximum": ("max.f32", float("-inf")),
+        "max": ("max.f32", float("-inf")),
+        "minimum": ("min.f32", float("inf")),
+        "min": ("min.f32", float("inf")),
+    }
+
+    def _accum_spec(self, stmt):
+        op = self._operation_name(stmt.op).lower()
+        if op not in self._ACCUM:
+            raise NotImplementedError(f"Unsupported accumulator op: {op}")
+        return self._ACCUM[op]
+
+    def _seed_accum(self, stmt):
+        _, identity = self._accum_spec(stmt)
+        reg = self.gen.register(".f32")
+        self._emit(f"mov.f32 {reg}, {self._f32_imm(identity)};")
+        self.values[stmt.name] = reg
+        return reg
+
+    def _gaccum(self, stmt):
+        if stmt.dtype is None or stmt.dtype.name != "f32":
+            raise NotImplementedError("Only f32 accumulators supported")
+
+        mnemonic, _ = self._accum_spec(stmt)
+        reg = self.values.get(stmt.name)
+        if reg is None:
+            reg = self._seed_accum(stmt)
+
+        if stmt.value not in self.values:
+            raise ValueError(f"Accum references undefined value: {stmt.value}")
+
+        # base, when present, replaces the previous accumulator value
+        # (online-softmax rescaling); otherwise fold into the accumulator.
+        if stmt.base is not None:
+            if stmt.base not in self.values:
+                raise ValueError(f"Accum base is undefined: {stmt.base}")
+            previous = self.values[stmt.base]
+        else:
+            previous = reg
+
+        self._emit(f"{mnemonic} {reg}, {previous}, {self.values[stmt.value]};")
+
+    def _seed_loop_accums(self, axis_name, body):
+        """Seed accumulators that reduce over this loop's axis."""
+        started = []
+        for stmt in self._walk(body):
+            if type(stmt).__name__ != "Accum":
+                continue
+            if (
+                axis_name in tuple(stmt.axes)
+                and stmt.name not in self.carried
+                and stmt.name not in self._live_inits
+            ):
+                self._seed_accum(stmt)
+                self._live_inits.add(stmt.name)
+                started.append(stmt.name)
+        return started
+
+    def _gloop(self, loop):
+        kind = type(loop).__name__
+        axis = loop.axis.name
+        extent = self._dim_value(loop.axis.extent)
+
+        if kind == "Loop":
+            start, step, end = 0, 1, extent
+        else:
+            start = self._gexpr(loop.start)
+            step = self._gexpr(loop.step)
+            end = extent if loop.end is None else self._gexpr(loop.end)
+
+            if not isinstance(step, int) or step <= 0:
+                raise NotImplementedError("Loop step must be a positive constant")
+
+        # Fully unroll small constant leaf loops flagged for unrolling.
+        # Loops that contain other loops stay real loops so the emitted
+        # PTX does not blow up multiplicatively.
+        body_stmts = list(self._walk(loop.body))
+        has_inner_loop = any(
+            type(s).__name__ in ("Loop", "StridedLoop") for s in body_stmts
+        )
+
+        if (
+            loop.unroll
+            and not has_inner_loop
+            and isinstance(start, int)
+            and isinstance(end, int)
+            and len(range(start, end, step)) <= self._MAX_UNROLL
+            and len(range(start, end, step)) * len(body_stmts)
+            <= self._MAX_UNROLL_STATEMENTS
+        ):
+            for value in range(start, end, step):
+                started = self._seed_loop_accums(axis, loop.body)
+                self.axes[axis] = value
+                self._gbody(loop.body)
+                for name in started:
+                    self._live_inits.discard(name)
+            self.axes.pop(axis, None)
+            return
+
+        started = self._seed_loop_accums(axis, loop.body)
+
+        counter = self.gen.register(".u32")
+        self._emit(f"mov.u32 {counter}, {self._imm(start) if isinstance(start, int) else start};")
+        self.axes[axis] = counter
+
+        top = self._new_general_label("loop")
+        done = self._new_general_label("loop_end")
+        stop = self.gen.register(".pred")
+
+        self.gen.label(top)
+        bound = self._imm(end) if isinstance(end, int) else end
+        self._emit(f"setp.ge.u32 {stop}, {counter}, {bound};")
+        self._emit(f"@{stop} bra {done};")
+
+        self._gbody(loop.body)
+
+        self._emit(f"add.u32 {counter}, {counter}, {step};")
+        self._emit(f"bra {top};")
+        self.gen.label(done)
+
+        self.axes.pop(axis, None)
+        for name in started:
+            self._live_inits.discard(name)
+
+    def _gcond(self, stmt):
+        cond = self._gpred(self._gexpr(stmt.cond))
+
+        if isinstance(cond, bool):
+            self._gbody(stmt.body if cond else stmt.else_body)
+            return
+
+        else_label = self._new_general_label("else")
+        end_label = self._new_general_label("endif")
+
+        self._emit(f"@!{cond} bra {else_label};")
+        self._gbody(stmt.body)
+
+        if tuple(stmt.else_body):
+            self._emit(f"bra {end_label};")
+            self.gen.label(else_label)
+            self._gbody(stmt.else_body)
+            self.gen.label(end_label)
+        else:
+            self.gen.label(else_label)
+
+    def _gsync(self, stmt):
+        if stmt.warp:
+            self._emit("bar.warp.sync 0xffffffff;")
+        elif stmt.count is None:
+            self._emit(f"bar.sync {stmt.barrier_id};")
+        else:
+            self._emit(f"bar.sync {stmt.barrier_id}, {stmt.count};")
+
+    def _gsmem(self, stmt):
+        if stmt.name in self.smem:
+            return
+
+        if stmt.dtype not in ("float", "f32"):
+            raise NotImplementedError("Only f32 shared arrays supported")
+
+        dims = tuple(self._dim_value(e) for e in stmt.extents)
+        count = math.prod(dims)
+        align = max(int(stmt.align or 0), 4)
+
+        base = self.gen.register(".u32")
+
+        if self._smem_dynamic:
+            offset = -(-self._smem_pool_used // align) * align
+            self._smem_pool_used = offset + 4 * count
+            self._emit(f"mov.u32 {base}, emmy_smem_pool;")
+            if offset:
+                shifted = self.gen.register(".u32")
+                self._emit(f"add.u32 {shifted}, {base}, {offset};")
+                base = shifted
+        else:
+            self.gen.shared(stmt.name, ".f32", length=count, align=align)
+            self._emit(f"mov.u32 {base}, {stmt.name};")
+
+        self.smem[stmt.name] = {"base": base, "dims": dims}
+
+    def _gcpasync(self, stmt):
+        if str(stmt.swizzle).upper() != "NONE":
+            raise NotImplementedError("Swizzled cp.async is not supported")
+
+        nbytes = stmt.nbytes
+        if nbytes not in (4, 8, 16):
+            raise NotImplementedError("cp.async copies 4, 8 or 16 bytes")
+
+        if stmt.smem not in self.smem:
+            raise ValueError(f"cp.async targets undeclared shared array: {stmt.smem}")
+
+        dst_dims = self.smem[stmt.smem]["dims"]
+
+        # Destination = tile origin + per-lane offset (when provided).
+        coords = [self._gexpr(e) for e in stmt.smem_index]
+        if stmt.lane_index is not None:
+            lane = [self._gexpr(e) for e in stmt.lane_index]
+            if len(lane) != len(coords):
+                raise NotImplementedError("lane_index rank mismatch")
+            coords = [self._garith("+", c, l) for c, l in zip(coords, lane)]
+
+        if len(coords) != len(dst_dims):
+            raise NotImplementedError("smem_index rank mismatch")
+
+        flat_dst = coords[0] if coords else 0
+        for coord, dim in zip(coords[1:], dst_dims[1:]):
+            flat_dst = self._garith("+", self._garith("*", flat_dst, dim), coord)
+
+        src_space, src_dims = self._buffer_space(stmt.src)
+        if src_space != "global":
+            raise NotImplementedError("cp.async source must be global memory")
+
+        flat_src = self._flatten(stmt.src_index, src_dims)
+
+        dst_base, dst_off = self._gmem_ref("shared", stmt.smem, flat_dst)
+        src_base, src_off = self._gmem_ref("global", stmt.src, flat_src)
+
+        cache = "cg" if nbytes == 16 else "ca"
+        self._emit(
+            f"cp.async.{cache}.shared.global "
+            f"{self._operand(dst_base, dst_off)}, "
+            f"{self._operand(src_base, src_off)}, {nbytes};"
+        )
+
+    def _gbody(self, statements):
+        for stmt in statements:
+            kind = type(stmt).__name__
+
+            if kind == "Load":
+                self._gload(stmt)
+            elif kind == "Assign":
+                self._assign(stmt)
+            elif kind == "Let":
+                self._glet(stmt)
+            elif kind == "Init":
+                self._ginit(stmt)
+            elif kind == "Accum":
+                self._gaccum(stmt)
+            elif kind in ("Loop", "StridedLoop"):
+                self._gloop(stmt)
+            elif kind == "Cond":
+                self._gcond(stmt)
+            elif kind == "Sync":
+                self._gsync(stmt)
+            elif kind == "Smem":
+                self._gsmem(stmt)
+            elif kind == "CpAsyncCopy":
+                self._gcpasync(stmt)
+            elif kind == "CpAsyncCommit":
+                self._emit("cp.async.commit_group;")
+            elif kind == "CpAsyncWait":
+                self._emit(f"cp.async.wait_group {int(stmt.group)};")
+            elif kind == "Write":
+                self._gwrite(stmt)
+            else:
+                raise NotImplementedError(
+                    f"General lowering does not support {kind}"
+                )
+
+    # ------------------------- tile + launch --------------------------
+
+    def _decode_axes(self, axes, source):
+        """Decode row-major tile axes from a linear index register."""
+        remaining = source
+        for position, axis in enumerate(reversed(axes)):
+            extent = self._dim_value(axis.extent)
+            outermost = position == len(axes) - 1
+
+            if extent == 1:
+                self.axes[axis.name] = 0
+            elif outermost:
+                self.axes[axis.name] = remaining
+            else:
+                self.axes[axis.name] = self._garith("%", remaining, extent)
+                remaining = self._garith("/", remaining, extent)
+
+    def _lower_general(self, tile):
+        """Lower a multi-axis Tile whose body is generic statements."""
+        threads = tile.block_threads
+        if type(threads) is not int or threads <= 0:
+            raise NotImplementedError("General lowering requires block_threads")
+        if getattr(tile, "aux_threads", 0):
+            raise NotImplementedError("Auxiliary threads are not supported")
+
+        launch = self.kernel.launch
+        block = launch.get("block")
+        grid = launch.get("grid")
+
+        if block is None or grid is None:
+            raise ValueError("General lowering requires grid/block metadata")
+
+        # Trailing axes spanning block_threads cells are thread axes;
+        # the leading axes are decoded from the block index.
+        axes = list(tile.axes)
+        product = 1
+        split = len(axes)
+        while split > 0 and product < threads:
+            split -= 1
+            product *= self._dim_value(axes[split].extent)
+
+        if product != threads:
+            raise NotImplementedError(
+                "Tile axes do not factor into block_threads"
+            )
+
+        block_axes = axes[:split]
+        thread_axes = axes[split:]
+        block_cells = math.prod(
+            self._dim_value(a.extent) for a in block_axes
+        )
+
+        if (
+            list(block) != [threads, 1, 1]
+            or list(grid) != [block_cells, 1, 1]
+        ):
+            raise NotImplementedError(
+                "Launch geometry does not match the Tile schedule"
+            )
+
+        # Shared memory: dynamic pool when the launch provides it,
+        # static declarations otherwise.
+        total = 0
+        for stmt in self._walk(tile.body):
+            if type(stmt).__name__ == "Smem":
+                align = max(int(stmt.align or 0), 4)
+                size = 4 * math.prod(self._dim_value(e) for e in stmt.extents)
+                total = -(-total // align) * align + size
+
+        provided = int(launch.get("smem_bytes", 0) or 0)
+        self._smem_dynamic = total > 0 and provided >= total
+
+        if self._smem_dynamic:
+            self.module_decls.append(
+                ".extern .shared .align 16 .b8 emmy_smem_pool[];"
+            )
+
+        self.tid = self.gen.register(".u32")
+        self.bid = self.gen.register(".u32")
+        self._emit(f"mov.u32 {self.tid}, %tid.x;")
+        self._emit(f"mov.u32 {self.bid}, %ctaid.x;")
+
+        self._decode_axes(thread_axes, self.tid)
+        self._decode_axes(block_axes, self.bid)
+
+        self._gbody(tile.body)
+
+    def _render_general(self):
+        entry = self.gen.render_entry()
+        if self.module_decls:
+            return "\n".join(self.module_decls) + "\n\n" + entry
+        return entry
+
     def lower(self):
         """Lower supported Emmy Kernel IR into PTX."""
 
@@ -4637,6 +5391,15 @@ class EmmyIRLowering:
                     "TreeHalve", "Assign",
                     "Assign", "StridedLoop",
                 )
+
+                # 0. Matmul / attention-style kernels: nested Loop and
+                #    Init statements over a multi-axis Tile.
+                if (
+                    ("Loop" in kinds or "Init" in kinds)
+                    and set(kinds) <= self._GENERAL_KINDS
+                ):
+                    self._lower_general(root)
+                    return self._render_general()
 
                 # 1. Row softmax
                 if kinds == softmax_pattern:
