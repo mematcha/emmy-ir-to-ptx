@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+.idea/
+.vscode/
 
 # organizer-only evaluation material
 hidden/
@@ -8,3 +10,8 @@ hidden_full/
 expressions_hidden.py
 
 internal/
+
+*.ptx
+run.sh
+baseline_results.json
+baseline_results.log
