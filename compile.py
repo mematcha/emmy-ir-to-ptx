@@ -9,12 +9,8 @@ import struct
 from typing import Any
 from collections.abc import Mapping
 import json
-# --------------------------------------------------
-# 1. Logging
-# --------------------------------------------------
 
 logger = logging.getLogger("emmy-ptx")
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-5s | %(filename)s:%(lineno)d | %(message)s",
@@ -22,25 +18,12 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 
-class Register:
-    def __init__(self, name: str):
-        self.name = name
-        self.value = 0
-    def __str__(self) -> str:
-        return f"%{self.name}"
-
-# --------------------------------------------------
-# 2. Compiler (we'll implement this incrementally)
-# --------------------------------------------------
-
 PTX_VERSION = "8.0"
 TARGET_ARCH = "sm_89"
 ADDRESS_SIZE = 64
 
-
 _MISSING = object()
 
-# PTX ISA 9.4 — NVIDIA Table 1: Directives
 PTX_DIRECTIVES = frozenset("""
     .address_size .explicitcluster .maxnreg .section
     .alias .extern .maxntid .shared
@@ -53,7 +36,6 @@ PTX_DIRECTIVES = frozenset("""
     .entry .maxnctapersm .reqntid
 """.split())
 
-# PTX ISA 9.4 — NVIDIA Table 2: Reserved Instruction Keywords
 PTX_INSTRUCTIONS = frozenset("""
     abs activemask add addc alloca and applypriority atom
     bar barrier bfe bfi bfind bmsk bra brev brkpt brx
@@ -76,7 +58,6 @@ PTX_INSTRUCTIONS = frozenset("""
     vshl vshr vsub vsub2 vsub4 wgmma wmma xor
 """.split())
 
-# PTX ISA 9.4 — NVIDIA Table 3: Predefined Identifiers
 PTX_PREDEFINED = frozenset("""
     %aggr_smem_size %dynamic_smem_size
     %clock %clock64 %globaltimer %globaltimer_hi
@@ -960,9 +941,6 @@ class PTXConstants:
 
         return literal
 
-# Paste this block into compile.py above class PTXEmitter.
-# Requires: import re; from dataclasses import dataclass
-
 class PTXABI:
     """PTX ISA 9.4 Section 7: device-function ABI syntax and stack helpers.
 
@@ -1205,11 +1183,6 @@ class PTXMemoryConsistency:
         if not isinstance(write_a, bool) or not isinstance(write_b, bool):
             raise TypeError('write flags must be bool')
         return cls.overlaps(start_a, size_a, start_b, size_b) and (write_a or write_b)
-
-# Paste this entire class into compile.py AFTER PTXType and PTXOperands,
-# and BEFORE PTXEmitter. It uses PTXType and PTXOperands already in compile.py.
-# PTX ISA 9.4 Chapter 9, Phase 1 (core arithmetic/conversion) and
-# Phase 2 (memory and address conversion). Conservative sm_89 subset.
 
 class PTXInstructionSet:
     """Build a validated, deliberately narrow set of PTX instructions.
@@ -1550,9 +1523,6 @@ class PTXInstructionSet:
             self._operand(dst, destination=True), self._operand(src),
         )
 
-
-
-
 @dataclass(frozen=True)
 class EmmyKernelIR:
     """Validated kernel view. `graph` and `body` remain Emmy-native objects."""
@@ -1565,7 +1535,6 @@ class EmmyKernelIR:
     arg_order: tuple[str, ...] | None
     launch: dict
     metadata: dict
-
 
 class EmmyIRParser:
     """Read an Emmy Graph without using Emmy's CUDA lowering/rendering.
