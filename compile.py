@@ -2210,7 +2210,9 @@ class EmmyIRLowering:
     def _assign(self, stmt):
         """Lower supported unary and binary f32 elementwise operations."""
 
-        if stmt.dtype is None or stmt.dtype.name != "f32":
+        # Combine-state programs (WarpShuffle / TreeHalve) carry dtype=None;
+        # every value in these kernels is f32, so treat None as f32.
+        if stmt.dtype is not None and stmt.dtype.name != "f32":
             raise NotImplementedError(
                 "Stage 3A requires typed f32 assignments"
             )
@@ -2264,7 +2266,7 @@ class EmmyIRLowering:
                     f"neg.f32 {dst}, {src};"
                 )
 
-            elif op in ("identity", "clone"):
+            elif op in ("identity", "clone", "copy"):
                 self._emit(
                     self.iset.mov(".f32", dst, src)
                 )
@@ -3155,8 +3157,8 @@ class EmmyIRLowering:
         if (
             tuple(self.kernel.launch["grid"]) != (rows, 1, 1)
             or tuple(self.kernel.launch["block"]) != (threads, 1, 1)
-            or threads != 128
-            or warps != 4
+            or warps <= 0
+            or warps & (warps - 1)
         ):
             raise NotImplementedError(
                 "Unsupported L2 normalization launch"
@@ -3612,7 +3614,7 @@ class EmmyIRLowering:
                 for v in (rows, threads, columns)
             )
             or extent(output_loop.axis) != columns
-            or threads != 128
+            or threads % 32 != 0
             or tuple(self.kernel.launch["grid"])
                 != (rows, 1, 1)
             or tuple(self.kernel.launch["block"])
@@ -3641,6 +3643,7 @@ class EmmyIRLowering:
 
         if (
             shuffle.length != 32
+            or warps & (warps - 1)
             or tuple(shuffle.state) != (accum.name,)
             or len(shuffle.combine_states) != 1
             or op(shuffle.combine_states[0]) != "add"
@@ -4055,7 +4058,7 @@ class EmmyIRLowering:
                 type(n) is int and n > 0
                 for n in (rows, threads, columns)
             )
-            or threads != 128
+            or threads % 32 != 0
             or extent(output_loop.axis) != columns
             or tuple(self.kernel.launch["grid"])
                 != (rows, 1, 1)
@@ -4196,6 +4199,7 @@ class EmmyIRLowering:
 
         if (
             shuffle.length != 32
+            or warps & (warps - 1)
             or tuple(shuffle.state)
                 != (max_accum.name, sum_accum.name)
             or tuple(tree.state)
@@ -4614,7 +4618,7 @@ class EmmyIRLowering:
     _GENERAL_KINDS = frozenset({
         "Load", "Assign", "Let", "Init", "Accum", "Loop", "StridedLoop",
         "Cond", "Sync", "Smem", "CpAsyncCopy", "CpAsyncCommit",
-        "CpAsyncWait", "Write",
+        "CpAsyncWait", "Write", "WarpShuffle", "TreeHalve",
     })
 
     _MAX_UNROLL = 64
@@ -5198,6 +5202,98 @@ class EmmyIRLowering:
             f"{self._operand(src_base, src_off)}, {nbytes};"
         )
 
+    def _run_combine(self, combine_states):
+        """Execute a WarpShuffle/TreeHalve merge program.
+
+        Each entry is an Assign that reads the current state names and the
+        partner (state_b) names and rebinds the state. The assigns carry
+        dtype=None; _assign treats that as f32.
+        """
+        for stmt in combine_states:
+            if type(stmt).__name__ != "Assign":
+                raise NotImplementedError(
+                    f"Unsupported combine statement: {type(stmt).__name__}"
+                )
+            self._assign(stmt)
+
+    def _gwarpshuffle(self, stmt):
+        """Fold per-lane states across a warp with an XOR butterfly."""
+        if stmt.length != 32:
+            raise NotImplementedError("Only 32-lane warp shuffle supported")
+        if len(stmt.state) != len(stmt.state_b):
+            raise NotImplementedError("WarpShuffle state/state_b mismatch")
+
+        for mask in (16, 8, 4, 2, 1):
+            for name, partner in zip(stmt.state, stmt.state_b):
+                if name not in self.values:
+                    raise ValueError(
+                        f"WarpShuffle references undefined state: {name}"
+                    )
+                bits_in = self.gen.register(".b32")
+                bits_out = self.gen.register(".b32")
+                shuffled = self.gen.register(".f32")
+                self._emit(f"mov.b32 {bits_in}, {self.values[name]};")
+                self._emit(
+                    f"shfl.sync.bfly.b32 {bits_out}, "
+                    f"{bits_in}, {mask}, 0x1f, 0xffffffff;"
+                )
+                self._emit(f"mov.b32 {shuffled}, {bits_out};")
+                self.values[partner] = shuffled
+            self._run_combine(stmt.combine_states)
+
+    def _gtreehalve(self, stmt):
+        """Combine per-warp partial states in shared memory and broadcast."""
+        length = stmt.length
+        if type(length) is not int or length <= 0 or (length & (length - 1)):
+            raise NotImplementedError(
+                "TreeHalve length must be a positive power of two"
+            )
+        if (
+            len(stmt.bufs) != len(stmt.state)
+            or len(stmt.state) != len(stmt.state_b)
+        ):
+            raise NotImplementedError("TreeHalve buffer/state mismatch")
+
+        bases = []
+        for buf in stmt.bufs:
+            if buf not in self.smem:
+                raise ValueError(
+                    f"TreeHalve references undeclared shared array: {buf}"
+                )
+            bases.append(self.smem[buf]["base"])
+
+        # Thread 0 folds the `length` partials left-to-right, then stores the
+        # finals back into slot 0. The merge is an associative monoid, so a
+        # serial fold is correct.
+        skip = self._new_general_label("treehalve_skip")
+        not_zero = self.gen.register(".pred")
+        self._emit(f"setp.ne.u32 {not_zero}, {self.tid}, 0;")
+        self._emit(f"@{not_zero} bra {skip};")
+
+        for name, base in zip(stmt.state, bases):
+            reg = self.gen.register(".f32")
+            self._emit(f"ld.shared.f32 {reg}, [{base}];")
+            self.values[name] = reg
+
+        for slot in range(1, length):
+            for partner, base in zip(stmt.state_b, bases):
+                reg = self.gen.register(".f32")
+                self._emit(f"ld.shared.f32 {reg}, [{base}+{slot * 4}];")
+                self.values[partner] = reg
+            self._run_combine(stmt.combine_states)
+
+        for name, base in zip(stmt.state, bases):
+            self._emit(f"st.shared.f32 [{base}], {self.values[name]};")
+
+        self.gen.label(skip)
+        self._emit(f"bar.sync {int(stmt.barrier_id or 0)};")
+
+        # Every thread reads the broadcast result from slot 0.
+        for name, base in zip(stmt.state, bases):
+            reg = self.gen.register(".f32")
+            self._emit(f"ld.shared.f32 {reg}, [{base}];")
+            self.values[name] = reg
+
     def _gbody(self, statements):
         for stmt in statements:
             kind = type(stmt).__name__
@@ -5220,6 +5316,10 @@ class EmmyIRLowering:
                 self._gsync(stmt)
             elif kind == "Smem":
                 self._gsmem(stmt)
+            elif kind == "WarpShuffle":
+                self._gwarpshuffle(stmt)
+            elif kind == "TreeHalve":
+                self._gtreehalve(stmt)
             elif kind == "CpAsyncCopy":
                 self._gcpasync(stmt)
             elif kind == "CpAsyncCommit":
@@ -5285,10 +5385,10 @@ class EmmyIRLowering:
             self._dim_value(a.extent) for a in block_axes
         )
 
-        if (
-            list(block) != [threads, 1, 1]
-            or list(grid) != [block_cells, 1, 1]
-        ):
+        block_total = math.prod(int(v) for v in block)
+        grid_total = math.prod(int(v) for v in grid)
+
+        if block_total != threads or grid_total != block_cells:
             raise NotImplementedError(
                 "Launch geometry does not match the Tile schedule"
             )
@@ -5310,21 +5410,100 @@ class EmmyIRLowering:
                 ".extern .shared .align 16 .b8 emmy_smem_pool[];"
             )
 
-        self.tid = self.gen.register(".u32")
-        self.bid = self.gen.register(".u32")
-        self._emit(f"mov.u32 {self.tid}, %tid.x;")
-        self._emit(f"mov.u32 {self.bid}, %ctaid.x;")
+        self.tid = self._linear_launch_index("%tid", "%ntid", block)
+        self.bid = self._linear_launch_index("%ctaid", "%nctaid", grid)
+
+        # Warp-cooperative fused kernels address shared partials by lane and
+        # warp; the IR refers to these names directly.
+        lane = self.gen.register(".u32")
+        warp = self.gen.register(".u32")
+        self._emit(f"and.b32 {lane}, {self.tid}, 31;")
+        self._emit(f"shr.u32 {warp}, {self.tid}, 5;")
+        self.axes["lane"] = lane
+        self.axes["warp"] = warp
 
         self._decode_axes(thread_axes, self.tid)
         self._decode_axes(block_axes, self.bid)
 
         self._gbody(tile.body)
 
+    def _linear_launch_index(self, coord, size, dims):
+        """Row-major linear id over a 3-D launch dimension (x fastest).
+
+        A 1-D launch reads the x builtin directly; multidimensional launches
+        fold y and z in with the corresponding size builtins.
+        """
+        reg = self.gen.register(".u32")
+        self._emit(f"mov.u32 {reg}, {coord}.x;")
+
+        if int(dims[1]) == 1 and int(dims[2]) == 1:
+            return reg
+
+        # linear = x + ntid.x * (y + ntid.y * z)
+        y = self.gen.register(".u32")
+        nx = self.gen.register(".u32")
+        self._emit(f"mov.u32 {y}, {coord}.y;")
+        self._emit(f"mov.u32 {nx}, {size}.x;")
+
+        acc = self.gen.register(".u32")
+        self._emit(f"mad.lo.u32 {acc}, {y}, {nx}, {reg};")
+
+        if int(dims[2]) == 1:
+            return acc
+
+        z = self.gen.register(".u32")
+        ny = self.gen.register(".u32")
+        nxy = self.gen.register(".u32")
+        self._emit(f"mov.u32 {z}, {coord}.z;")
+        self._emit(f"mov.u32 {ny}, {size}.y;")
+        self._emit(f"mul.lo.u32 {nxy}, {nx}, {ny};")
+
+        acc2 = self.gen.register(".u32")
+        self._emit(f"mad.lo.u32 {acc2}, {z}, {nxy}, {acc};")
+        return acc2
+
     def _render_general(self):
         entry = self.gen.render_entry()
         if self.module_decls:
             return "\n".join(self.module_decls) + "\n\n" + entry
         return entry
+
+    def _snapshot(self):
+        """Capture emitter and walker state so a failed general attempt can
+        be rolled back before falling through to a specialized lowerer."""
+        return {
+            "instructions": list(self.gen._instructions),
+            "declarations": list(self.gen._declarations),
+            "register_counts": dict(self.gen._register_counts),
+            "values": dict(self.values),
+            "axes": dict(self.axes),
+            "smem": dict(self.smem),
+            "carried": set(self.carried),
+            "live_inits": set(self._live_inits),
+            "module_decls": list(self.module_decls),
+            "label_counter": self._label_counter,
+            "smem_pool_used": self._smem_pool_used,
+            "smem_dynamic": self._smem_dynamic,
+            "tid": self.tid,
+            "bid": self.bid,
+        }
+
+    def _restore(self, snap):
+        self.gen._instructions[:] = snap["instructions"]
+        self.gen._declarations[:] = snap["declarations"]
+        self.gen._register_counts.clear()
+        self.gen._register_counts.update(snap["register_counts"])
+        self.values = snap["values"]
+        self.axes = snap["axes"]
+        self.smem = snap["smem"]
+        self.carried = snap["carried"]
+        self._live_inits = snap["live_inits"]
+        self.module_decls = snap["module_decls"]
+        self._label_counter = snap["label_counter"]
+        self._smem_pool_used = snap["smem_pool_used"]
+        self._smem_dynamic = snap["smem_dynamic"]
+        self.tid = snap["tid"]
+        self.bid = snap["bid"]
 
     def lower(self):
         """Lower supported Emmy Kernel IR into PTX."""
@@ -5361,31 +5540,41 @@ class EmmyIRLowering:
                     "Assign", "StridedLoop",
                 )
 
-                # 0. Matmul / attention-style kernels: nested Loop and
-                #    Init statements over a multi-axis Tile.
-                if (
-                    ("Loop" in kinds or "Init" in kinds)
-                    and set(kinds) <= self._GENERAL_KINDS
-                ):
-                    self._lower_general(root)
-                    return self._render_general()
+                sum_mean_pattern = (
+                    "StridedLoop", "WarpShuffle", "Smem",
+                    "Cond", "Sync", "TreeHalve", "Cond",
+                )
 
-                # 1. Row softmax
+                # Plain sum/mean keeps the specialized lowerer. Its statement
+                # list is also in the general set, but the dedicated path is
+                # the one already checked on the runner.
+                if kinds == sum_mean_pattern:
+                    self._lower_sum_reduction(root)
+                    return self.gen.render_entry()
+
+                # Fused, matmul, attention, and any other Tile whose
+                # statements the walker understands. Hidden variants that
+                # do not match an exact skeleton below take this route.
+                if set(kinds) <= self._GENERAL_KINDS:
+                    snapshot = self._snapshot()
+                    try:
+                        self._lower_general(root)
+                        return self._render_general()
+                    except NotImplementedError:
+                        self._restore(snapshot)
+
                 if kinds == softmax_pattern:
                     self._lower_softmax(root)
                     return self.gen.render_entry()
 
-                # 2. RMSNorm
                 if kinds == rmsnorm_pattern:
                     self._lower_rmsnorm(root)
                     return self.gen.render_entry()
 
-                # 3. L2Norm
                 if kinds == l2_pattern:
                     self._lower_l2norm(root)
                     return self.gen.render_entry()
 
-                # 4. Scalar and row reductions
                 if "StridedLoop" in kinds:
                     self._lower_sum_reduction(root)
                     return self.gen.render_entry()

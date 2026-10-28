@@ -56,7 +56,7 @@ def test_l2norm_normalization():
     ptx = get_ptx()
 
     assert "sqrt.rn.f32" in ptx
-    assert "div.rn.f32" in ptx
+    assert "rcp.rn.f32" in ptx
     assert "st.global.f32" in ptx
 
 
