@@ -1829,6 +1829,10 @@ class EmmyIRParser:
         return result
 
     def parse(self):
+        """
+        Parse the input path into an Emmy IR kernel.
+        Returns an EmmyKernelIR object.
+        """
         payload = self._read_json(self.input_path)
 
         try:
@@ -1845,13 +1849,16 @@ class EmmyIRParser:
                 f'Emmy could not deserialize {self.input_path}: {exc}'
             ) from exc
 
+        # get the nodes from the graph
         nodes = getattr(graph, 'nodes', None)
 
+        # validate the nodes are a mapping
         if not isinstance(nodes, Mapping):
             raise ValueError(
                 'Deserialized Emmy Graph has no nodes mapping'
             )
 
+        # initialize the kernels list and add the KernelOp to the list
         kernels = []
 
         for key, node in nodes.items():
@@ -1860,6 +1867,7 @@ class EmmyIRParser:
             if op is not None and type(op).__name__ == 'KernelOp':
                 kernels.append((key, op))
 
+        # only one KernelOp is allowed
         if len(kernels) != 1:
             raise ValueError(
                 f'Expected exactly one KernelOp, found {len(kernels)}'
@@ -5571,14 +5579,21 @@ class EmmyIRLowering:
         return entry
 
     def lower(self):
-        """Lower supported Emmy Kernel IR into PTX."""
+        """
+        Lower supported Emmy Kernel IR into PTX.
+        Returns the PTX code as a string.
+        """
 
         self._prologue()
 
         if len(self.kernel.body) == 1:
             root = self.kernel.body[0]
 
+            # validate the root is a Tile
+            # Tile is the outer statement of a Emmy Kernel IR --> 
+            # The idea is that we start identifying at the root of the kernel
             if type(root).__name__ == "Tile":
+                # get the kinds of the statements in the body
                 kinds = tuple(
                     type(stmt).__name__
                     for stmt in root.body
@@ -5707,6 +5722,7 @@ class PTXEmitter:
 
         base = opcode.split(".", 1)[0]
 
+        # Validate using the PTX_INSTRUCTIONS dictionary
         if base not in PTX_INSTRUCTIONS:
             raise ValueError(f"Unknown PTX instruction keyword: {base}")
 
@@ -5716,6 +5732,7 @@ class PTXEmitter:
     def _validate_directive(cls, directive: str) -> str:
         """Check a PTX directive keyword."""
 
+        # Validate using the PTX_DIRECTIVES dictionary
         if directive not in PTX_DIRECTIVES:
             raise ValueError(f"Unknown PTX directive: {directive}")
 
@@ -5726,12 +5743,14 @@ class PTXEmitter:
 
         self._validate_identifier(f"{prefix}0")
 
+        # initialize the name counter for the prefix if the key doesnt exist
         number = self._name_counters.get(prefix, 0)
 
         while True:
+            # generate a new name with the prefix and the number
             name = f"{prefix}{number}"
             number += 1
-
+            # if the name has not been used yet, add it to the used names and the name counters
             if name not in self._used_names:
                 self._used_names.add(name)
                 self._name_counters[prefix] = number
@@ -5753,6 +5772,7 @@ class PTXEmitter:
         self.ptx_code += f".target {TARGET_ARCH}\n"
         self.ptx_code += f".address_size {ADDRESS_SIZE}\n"
 
+    # extra method not used
     def _emit_comment(self, message: str) -> None:
         """Generate a single-line PTX comment."""
 
@@ -5763,7 +5783,7 @@ class PTXEmitter:
         logger.debug("Generating PTX comment: %s", message)
         message.encode("ascii")
         self.ptx_code += f"// {message}\n"
-
+    # extra method not used
     def _emit_block_comment(self, message: str) -> None:
         """Generate a multi-line PTX block comment."""
         if "*/" in message or "/*" in message:
@@ -5772,6 +5792,7 @@ class PTXEmitter:
         message.encode("ascii")
         self.ptx_code += f"/*\n{message}\n*/\n"
 
+    # extra method not used
     def _emit_instruction(
         self,
         opcode: str,
@@ -5835,21 +5856,26 @@ class PTXEmitter:
 
         self.ptx_code += prefix + instruction
 
+    # main method to compile the PTX
     def compile_ptx(self, input_path: Path) -> str:
         """Compile a supported Emmy kernel directly to PTX."""
 
         self.ptx_code = ""
 
+        # parse the input path into an Emmy IR kernel Object with the required metadata
         kernel = EmmyIRParser(
             input_path,
             require_meta=True,
         ).parse()
 
+        # generate the PTX header
         self._generate_ptx_header()
         self.ptx_code += "\n"
 
+        # lower the Emmy IR kernel to PTX
         self.ptx_code += EmmyIRLowering(kernel).lower()
 
+        # return the PTX code
         return self.ptx_code
 
 #endregion: PTXEmitter class
