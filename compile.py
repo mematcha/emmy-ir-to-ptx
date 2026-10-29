@@ -1,4 +1,6 @@
+# Emmy IR Python Compiler Written by Sathwik Matcha 
 
+# region: imports and logging
 import argparse
 import logging
 import sys
@@ -9,6 +11,7 @@ import struct
 from typing import Any
 from collections.abc import Mapping
 import json
+from dataclasses import dataclass # 
 
 logger = logging.getLogger("emmy-ptx")
 logging.basicConfig(
@@ -17,13 +20,22 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     stream=sys.stderr,
 )
+# endregion: imports and logging
 
+# region: constants definitions
+# Setting PTX_VERSION to 8.0 and TARGET_ARCH to sm_89 as per the requirements. Address_size is set to 64 as per the requirements.
 PTX_VERSION = "8.0"
 TARGET_ARCH = "sm_89"
 ADDRESS_SIZE = 64
 
+# _MISSING is a sentinel object used to indicate missing values.
+# Sentinel objects are dummy objects used to indicate a specific state or value, like missing arguments, vales etc..
+# Reference: https://docs.python.org/3/library/collections.abc.html#collections.abc.Mapping
 _MISSING = object()
 
+# PTX_DIRECTIVES is a set of PTX directives.
+# PTX Directives are commands that instruct the assembler on HOW to process the code. They all start with a dot.
+# Reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#directive-statements-ptx-directives
 PTX_DIRECTIVES = frozenset("""
     .address_size .explicitcluster .maxnreg .section
     .alias .extern .maxntid .shared
@@ -36,6 +48,9 @@ PTX_DIRECTIVES = frozenset("""
     .entry .maxnctapersm .reqntid
 """.split())
 
+# Set of PTX instructions.
+# PTX instructions are the actual instructions that are executed by the GPU.
+# Reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#instruction-statements-reserved-instruction-keywords-new
 PTX_INSTRUCTIONS = frozenset("""
     abs activemask add addc alloca and applypriority atom
     bar barrier bfe bfi bfind bmsk bra brev brkpt brx
@@ -58,6 +73,8 @@ PTX_INSTRUCTIONS = frozenset("""
     vshl vshr vsub vsub2 vsub4 wgmma wmma xor
 """.split())
 
+# PTX_PREDEFINED is a set of predefined identifiers in PTX.
+# Reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#identifiers-predefined-identifiers
 PTX_PREDEFINED = frozenset("""
     %aggr_smem_size %dynamic_smem_size
     %clock %clock64 %globaltimer %globaltimer_hi
@@ -75,14 +92,22 @@ PTX_PREDEFINED = frozenset("""
     WARP_SZ
 """.split())
 
+# endregion: constants
 
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
+# region: State Space Classes
+# StateSpaceProperties is a dataclass that contains the properties of a PTX state space.
+# frozen=True makes the class immutable and hashable.
+@dataclass(frozen=True) 
 class StateSpaceProperties:
-    """Static properties of a PTX state space."""
-
+    """
+    Static properties of a PTX state space.
+    
+    addressable: Whether the variable has a memory address to load (ld) or store (st) from/to.
+    read_only: Whether the variable is read-only, you cant make a store (st) to a read-only variable.
+    predefined: Whether the variable is predefined by the PTX ISA. example: .sreg, .const, .param
+    thread_scope: The scope of the variable. example: thread, context, cta_cluster, parameter
+    deprecated: Whether the variable is deprecated.
+    """
     addressable: bool | None
     read_only: bool | None
     predefined: bool
@@ -90,8 +115,16 @@ class StateSpaceProperties:
     deprecated: bool = False
 
 class StateSpace:
-    """Represent a PTX state space and its properties."""
+    """
+    Represents a PTX state space and its properties.
+    State spaces are the regions of memory that are accessible to the PTX ISA where data can be stored.
 
+    Reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#state-spaces
+    """
+
+
+    # Properties of the state spaces.
+    # Reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#state-spaces-state-spaces-tab
     PROPERTIES = {
         ".reg": StateSpaceProperties(
             addressable=False,
@@ -150,26 +183,31 @@ class StateSpace:
             deprecated=True,
         ),
     }
-
+    # Valid state spaces are the state spaces that are defined in the PTX ISA. Presented as a immutable frozenset.
     VALID_SPACES = frozenset(PROPERTIES)
 
     def __init__(self, name: str):
+        # Check if the name is a string.
         if not isinstance(name, str):
             raise TypeError(
                 "State space name must be a string."
             )
 
+        # Normalize the name to a valid state space name.
         normalized = (
             name if name.startswith(".") else f".{name}"
         )
-
+        # Check if the normalized name is a valid state space name.
         if normalized not in self.VALID_SPACES:
+            # Raise an error if the normalized name is not a valid state space name.
             raise ValueError(
                 f"Invalid PTX state space: {name!r}"
             )
 
+        # Set the name of the state space.
         self._name = normalized
 
+    # @property is a decorator that converts methods into attributes.
     @property
     def name(self) -> str:
         return self._name
@@ -206,9 +244,23 @@ class StateSpace:
     def __repr__(self) -> str:
         return f"StateSpace({self._name!r})"
 
+# endregion: State Space Classes
+
+# region: PTX Type Classes
 @dataclass(frozen=True)
 class PTXTypeInfo:
-    """Metadata for a PTX type or instruction data format."""
+    """
+    Metadata for a PTX type or instruction data format.
+    
+    category: A classification of PTX Types (signed/unsigned/float/bits/predicate)
+    bits: The number of bits in the PTX type. (s64 has 64 bits)
+    fundamental: Whether the PTX type is a fundamental type. (satisfies the fundamental category)
+    register_type: The type required for a basic register declaration. 
+    elements: The number of elements in the PTX type. (f16x2 has 2 elements)
+    element_type: The type of the element in the PTX type. (f16x2 has 2 elements of type f16)
+
+    Reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#types
+    """
 
     category: str
     bits: int
@@ -218,7 +270,11 @@ class PTXTypeInfo:
     element_type: str | None = None
 
 class PTXType:
-    """PTX ISA 9.4 Section 5.2 type metadata and validation."""
+    """
+    PTX ISA 9.4 Section 5.2 type metadata and validation.
+
+    Reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#types
+    """
 
     # Section 5.2.1 — fundamental types (Table 8)
     FUNDAMENTAL = {
@@ -295,6 +351,8 @@ class PTXType:
         ".s8x4": (".s8", 4, 32, ".b32"),
     }
 
+    # Section 5.2.6 — subword-8 instruction data types.
+    # These are instruction data types that are used in the subword-8 instructions.
     SUBWORD_8_INSTRUCTIONS = frozenset({
         "ld", "st", "add", "sub", "min", "max",
         "neg", "cvt",
@@ -468,46 +526,75 @@ class PTXType:
     def __repr__(self) -> str:
         return f"PTXType({self.name!r})"
 
+# endregion: PTX Type Classes
+
+# region: PTX Operands
 class PTXOperands:
-    """Reusable PTX operand constructors and shape-level checks (PTX chapter 6).
+    """Reusable PTX operand constructors and shape-level checks.
 
     This validates operand *syntax*, not complete instruction legality.
+    Reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#instruction-operands
     """
-
+    # Identifier regex for PTX operands.
     _NAME = re.compile(r"(?:[A-Za-z][A-Za-z0-9_$]*|[_$%][A-Za-z0-9_$]+)\Z", re.ASCII)
+    # Rounding modes for PTX operands.
     _ROUNDING = frozenset({".rn", ".rna", ".rz", ".rm", ".rp", ".rs",
                            ".rni", ".rzi", ".rmi", ".rpi"})
 
+    # Validate the identifier of a PTX operand.
     @staticmethod
     def _identifier(name: str) -> str:
         if not isinstance(name, str) or not PTXOperands._NAME.fullmatch(name):
+            # Raise an error if the identifier is not a valid PTX identifier.
             raise ValueError(f"Invalid PTX identifier: {name!r}")
         return name
 
+    # Validate the dtype of a PTX operand.
     @staticmethod
     def _dtype(dtype) -> str:
         # Reuse the compiler's PTXType objects, rather than type-name strings.
+        # Raise an error if the dtype is not a PTXType instance.
         if not isinstance(dtype, PTXType):
             raise TypeError("dtype must be a PTXType instance")
         return dtype.name
 
+    # Register operand subclass.
     @dataclass(frozen=True)
     class Register:
+
+        """
+        A register operand is a value stored in a register.
+        The thread loads it from memory or from a register.
+
+        add.f32 %f2, %f0, %f1;          // %f0 and %f1 are registers
+        mov.f32 %f3, %f0;               // %f0 is a register
+        """
         name: str
         dtype: object
 
+        # After initialization, use post init to validate the register.
         def __post_init__(self):
             PTXOperands._identifier(self.name)
             PTXOperands._dtype(self.dtype)
 
+        # Return the string representation of the register.
         def __str__(self):
             return self.name
 
     @dataclass(frozen=True)
     class Immediate:
+        """
+        An immediate operand is a constant written directly in the instruction. 
+        The thread does not load it from a register or from memory. The bits travel with the instruction.
+
+        setp.ge.u32 %p0, %r4, 64;          // 64 is the immediate
+        mul.wide.u32 %rd3, %r8, 4;         // 4 is the immediate
+        mov.f32 %f3, 0f3F800000;           // the bits of 1.0 are the immediate
+        """
         literal: str
         dtype: object
 
+        # After initialization, use post init to validate the immediate.
         def __post_init__(self):
             PTXOperands._dtype(self.dtype)
             if (not isinstance(self.literal, str) or not self.literal or
@@ -521,17 +608,30 @@ class PTXOperands:
 
     @dataclass(frozen=True)
     class Address:
+        """
+        An address operand is a memory location.
+        The thread loads it from memory or from a register.
+
+        ld.param.u64  %rd0, [param_x0];   // symbol address
+        ld.global.f32 %f0,  [%rd4];       // register address
+        ld.global.f32 %f1,  [%rd4+16];    // same register, 16 bytes later
+        """
         base: str | int
         offset: int = 0
         kind: str = "register"  # register, symbol, absolute
 
         def __post_init__(self):
+            # Validate the kind of the address.
             if self.kind not in {"register", "symbol", "absolute"}:
+                # Raise an error if the kind is not a valid address kind.
                 raise ValueError("Invalid address kind")
+            # Validate the offset of the address.
             if (isinstance(self.offset, bool) or not isinstance(self.offset, int)
                     or not -(1 << 31) <= self.offset < (1 << 31)):
                 raise ValueError("Address offset must be a signed 32-bit integer")
+            # Validate the base of the address.
             if self.kind == "absolute":
+                # Raise an error if the base is not a valid absolute address.
                 if (isinstance(self.base, bool) or not isinstance(self.base, int)
                         or not 0 <= self.base < (1 << 32) or self.offset):
                     raise ValueError("Absolute address must be a u32 with no offset")
@@ -546,27 +646,51 @@ class PTXOperands:
 
     @dataclass(frozen=True)
     class ArrayElement:
+        """
+        An array element operand is a value stored in an array.
+        The thread loads it from the array.
+
+        .shared .f32 acc0_smem[4];
+
+        st.shared.f32 acc0_smem[%r8], %f1;   // slot held in %r8
+        ld.shared.f32 %f4, acc0_smem[2];     // slot 2
+        ld.shared.f32 %f5, acc0_smem[%r8+1]; // that register, plus one
+        """
         array: str
         index: int | str
         offset: int = 0
 
         def __post_init__(self):
+            # Validate the array of the array element.
             PTXOperands._identifier(self.array)
+            # NOTE: bool is a subclass of int in Python, so isinstance(True, int) is true and True equals 1.
+            # Validate the index of the array element -- if index is a bool/ not an int nor a string, raise an error.
             if isinstance(self.index, bool) or not isinstance(self.index, (int, str)):
                 raise TypeError("Array index must be an int or register name")
+            # If the index is a string, validate the index as a PTX identifier.
             if isinstance(self.index, str):
                 PTXOperands._identifier(self.index)
+            # Validate the offset of the array element -- if offset is a bool/ not an int, raise an error.
             if isinstance(self.offset, bool) or not isinstance(self.offset, int):
                 raise TypeError("Array offset must be an int")
+            # If the index is an int and the offset is not 0, raise an error.
             if isinstance(self.index, int) and self.offset:
                 raise ValueError("Use a combined integer index")
 
         def __str__(self):
+            # Return the string representation of the array element.
             suffix = (f"+{self.offset}" if self.offset > 0 else str(self.offset)) if self.offset else ""
             return f"{self.array}[{self.index}{suffix}]"
 
     @dataclass(frozen=True)
     class Vector:
+        """
+        A vector operand is several registers used as one value.
+
+        ld.global.v2.f32 {%f0, %f1}, [%rd4];          // two floats, one load
+        st.global.v2.f32 [%rd12], {%f2, %f3};         // two floats, one store
+        ld.global.v4.f32 {%f0, %f1, %f2, %f3}, [%rd1]; // four floats
+        """
         registers: tuple
         destination: bool = False
 
@@ -585,19 +709,31 @@ class PTXOperands:
 
     @dataclass(frozen=True)
     class Component:
+        """
+        A component is one lane of a vector. e.g: %tid.x is the thread's index in the block along the x-axis for the block.
+        """
         name: str
         component: str
 
         def __post_init__(self):
             PTXOperands._identifier(self.name)
+            # Validate the component of the target vector.
             if self.component not in {"x", "y", "z", "w", "r", "g", "b", "a"}:
                 raise ValueError("Unsupported vector component")
 
         def __str__(self):
+            # Return the string representation of the component.
             return f"{self.name}.{self.component}"
 
     @dataclass(frozen=True)
     class Symbol:
+        """
+        A Symbol is the name of a label or a function. Unlike a register, it does not hold a value. It names a place in the program.
+        
+        Example:
+        setp.ne.s32     %p2, %r7, 0;
+        @%p2 bra        AFTER_STORE;    // AFTER_STORE is the symbol
+        """
         name: str
         kind: str  # label or function
 
@@ -608,6 +744,8 @@ class PTXOperands:
 
         def valid_for(self, opcode: str) -> bool:
             base = opcode.split(".", 1)[0]
+            # bra means branch to label, 
+            # whereas brx jumps through a register which holds a index of cases, picks the relevant case based on the register value.
             return base in ({"bra", "brx"} if self.kind == "label" else {"call", "mov"})
 
         def __str__(self):
@@ -615,6 +753,14 @@ class PTXOperands:
 
     @staticmethod
     def compatible_types(source, target) -> bool:
+        """
+        Check if two PTX types are compatible for arithmetic operations.
+
+        Example:
+        add.f32 %f2, %f0, %f1;          // %f0 and %f1 are compatible
+        add.s32 %r2, %r0, %r1;          // %r0 and %r1 are compatible
+        add.s32 %r2, %r0, %f1;          // %r0 and %f1 are not compatible
+        """
         PTXOperands._dtype(source)
         PTXOperands._dtype(target)
         if source.name == target.name:
@@ -627,6 +773,13 @@ class PTXOperands:
 
     @staticmethod
     def access_alignment_ok(byte_address: int, access_size_bytes: int) -> bool:
+        """
+        Check if the access alignment is OK. If the access size is 16 bytes, the byte address must be divisible by 16.
+
+        Example:
+        ld.global.f32 %f0, [%rd4];          // %rd4 is 16 bytes aligned when rd4 is 0, 16, 32, 48, etc.
+        ld.global.f32 %f1, [%rd4+1];        // %rd4+1 is not 16 bytes aligned because 1 is not divisible by 16
+        """
         for n in (byte_address, access_size_bytes):
             if isinstance(n, bool) or not isinstance(n, int):
                 raise TypeError("Address and access size must be integers")
@@ -636,19 +789,35 @@ class PTXOperands:
 
     @staticmethod
     def conversion_opcode(destination, source, *, rounding: str | None = None) -> str:
+        """
+        Construct the conversion opcode for the conversion of one PTX type to another.
+
+        Example:
+        cvt.rn.f16.f32 %f2, %f0;          // convert %f0 to f16 and round to nearest
+        """
         dest = PTXOperands._dtype(destination)
         src = PTXOperands._dtype(source)
         if rounding is not None and rounding not in PTXOperands._ROUNDING:
             raise ValueError(f"Unsupported rounding modifier: {rounding}")
         # Construct spelling only; detailed cvt legality is checked elsewhere.
         return f"cvt{rounding or ''}{dest}{src}"
+# endregion: PTX Operands
 
+# region: PTX Variable
 class PTXVariable:
-    """A validated PTX variable declaration; no instructions are emitted."""
+    """
+    A validated PTX variable declaration; no instructions are emitted.
+    A PTX Variable is a name you declare before any thread runs. The declaration gives it a state space and a type.
 
+    Example:
+    .param  .u64 param_x0; --> param_x0 is a 64-bit unsigned integer variable in the .param state space.
+    """
+
+    # State spaces that can be declared.
     _DECLARABLE_SPACES = frozenset({
         '.reg', '.const', '.global', '.local', '.param', '.shared'
     })
+    # Identifier regex for PTX variables.
     _IDENTIFIER = re.compile(r'(?:[A-Za-z][A-Za-z0-9_$]*|[_$%][A-Za-z0-9_$]+)\Z', re.ASCII)
 
     def __init__(
@@ -665,6 +834,9 @@ class PTXVariable:
         attribute: str | None = None,
         target: str = 'sm_89',
     ) -> None:
+        """
+        Initialize a PTX variable, by setting statespace, type and validations along with initalization
+        """
         self.state_space = state_space if isinstance(state_space, StateSpace) else StateSpace(state_space)
         self.dtype = dtype if isinstance(dtype, PTXType) else PTXType(dtype)
         self.name = self._validate_name(name)
@@ -810,11 +982,22 @@ class PTXVariable:
 
     def __repr__(self) -> str:
         return f'PTXVariable({self.name!r}, {self.state_space.name!r}, {self.dtype.name!r})'
+# endregion: PTX Variable
 
+# region: PTX Constants
 class PTXConstants:
-    """Manage PTX constant values and expressions."""
+    """
+    Manage PTX constant values and expressions. 
+    Contains methods to format integer, floating-point, and predicate constants.
+    
+    Reference:
+    https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#constants
+    """
 
     def __init__(self, version: str = PTX_VERSION):
+        """
+        Initialize the PTX constants.
+        """
         self.version = version
    
     def integer(
@@ -823,41 +1006,62 @@ class PTXConstants:
         unsigned: bool = False,
         base: int = 10,
     ) -> str:
-        """Format a PTX integer literal using PTX ISA rules."""
+        """
+        Format a PTX integer literal using PTX ISA rules.
 
+        Reference:
+        https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-constants
+        """
+        # Validate the input type and value range.
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError("Integer constant must be an int.")
-
+        # Validate the base. Reject unsupported bases.
         if base not in (2, 8, 10, 16):
             raise ValueError("Supported bases: 2, 8, 10, 16.")
 
+        # Define the minimum and maximum values for 64-bit signed and unsigned integers.
+        # S64-> 1bit sign + 63bits magnitude
+        # U64-> 64bits magnitude
         S64_MIN = -(1 << 63)
         S64_MAX = (1 << 63) - 1
         U64_MAX = (1 << 64) - 1
 
+        # Validate the value range based on the base and unsigned flag.
         if unsigned:
+            # For unsigned integers, only check against the upper bound.
             if not 0 <= value <= U64_MAX:
                 raise ValueError("Unsigned integer outside u64 range.")
+
+        # For signed integers, check against the full range.
         elif not S64_MIN <= value <= U64_MAX:
             raise ValueError("Integer outside PTX 64-bit range.")
 
         # Values above signed maximum require unsigned representation.
         is_unsigned = unsigned or value > S64_MAX
 
+        # Calculate the magnitude of the integer.
         magnitude = abs(value)
 
+        # Format the integer based on the base.
+        # Reference: https://docs.python.org/3/library/string.html#format-specification-mini-language
+        
+        # 10: Decimal --> integer converted to string
         if base == 10:
             literal = str(magnitude)
+        # 16: Hexadecimal --> 0x prefix + integer converted by :X to hex string
         elif base == 16:
             literal = f"0x{magnitude:X}"
+        # 8: Octal --> 0 prefix + integer converted by :o to octal string
         elif base == 8:
             literal = f"0{magnitude:o}"
+        # 2: Binary --> 0b prefix + integer converted by :b to binary string
         else:
             literal = f"0b{magnitude:b}"
-
+        # Add the unsigned flag if the integer is unsigned.
         if is_unsigned:
             literal += "U"
 
+        # Add the negative sign if the integer is negative.
         if value < 0:
             literal = "-" + literal
 
@@ -872,47 +1076,66 @@ class PTXConstants:
         return literal
    
     def floating(self, value: float) -> str:
-        """Format a finite PTX floating-point literal (f64)."""
+        """
+        Format a finite PTX floating-point literal (f64).
 
+        Reference:
+        https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-constants
+        """
+        # Validate the input type.
         if not isinstance(value, float):
             raise TypeError("Floating-point constant must be a float.")
 
+        # Validate the value is finite.
         if not math.isfinite(value):
             raise ValueError(
                 "Non-finite values require exact IEEE 754 notation."
             )
 
+        # Format the floating-point literal.
         literal = repr(value)
 
+        # Log the formatted floating-point literal.
         logger.debug(
             "Formatted PTX floating constant: %s", literal
         )
 
         return literal
 
-
     def float_bits(self, value: float, bits: int = 32) -> str:
-        """Format exact IEEE 754 floating-point bit notation."""
-
+        """
+        Format exact IEEE 754 floating-point BIT-WISE notation.
+        We use float_bits to format the floating-point literal as a hexadecimal string, 
+        which is then converted to a PTX floating-point literal.
+        Reference:
+        https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-constants
+        """
+        # Validate the input type.
         if not isinstance(value, float):
             raise TypeError("Floating-point constant must be a float.")
 
-        if bits not in (32, 64):
+        # Validate the bits. Reject unsupported bit formats.
+        if bits not in (32, 64): # f32 or f64
             raise ValueError("Floating-point bits must be 32 or 64.")
 
-        if bits == 32:
-            # Round Python's binary64 value into IEEE 754 binary32.
+        if bits == 32: # f32
+            
             try:
+                # Pack the value into a 4-byte(32 bits) big endian float
+                # Reference: https://docs.python.org/3/library/struct.html#format-characters
                 packed = struct.pack(">f", value)
             except OverflowError as exc:
                 raise ValueError(
                     "Value exceeds the finite f32 range."
                 ) from exc
-
+            # Convert the packed value to a hexadecimal string and format it as a PTX floating-point literal.
             literal = f"0f{int.from_bytes(packed, 'big'):08X}"
 
-        else:
+        else: # f64
+            # Pack the value into a 8-byte(64 bits) big endian double
+            # Reference: https://docs.python.org/3/library/struct.html#format-characters
             packed = struct.pack(">d", value)
+            # Convert the packed value to a hexadecimal string and format it as a PTX floating-point literal.
             literal = f"0d{int.from_bytes(packed, 'big'):016X}"
 
         logger.debug(
@@ -921,18 +1144,21 @@ class PTXConstants:
 
         return literal
 
-
     def predicate(self, value: int) -> str:
-        """Format a PTX predicate-compatible integer constant."""
+        """Format a PTX predicate-compatible integer constant.
+        
+        Reference:
+        https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#predicate-constants
+        """
+        # Validate the input type.
 
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError("Predicate constant must be an integer.")
-
         # Reuse our integer literal validator.
         self.integer(value)
-
+        # Format the predicate constant.
         literal = "0" if value == 0 else "1"
-
+        # Log the formatted predicate constant.
         logger.debug(
             "Formatted PTX predicate: input=%s, result=%s",
             value,
@@ -940,17 +1166,26 @@ class PTXConstants:
         )
 
         return literal
+# endregion: PTX Constants
 
+# region: PTX ABI
 class PTXABI:
-    """PTX ISA 9.4 Section 7: device-function ABI syntax and stack helpers.
-
+    """
     This formats and validates basic constructs. It does not choose the physical
     calling convention or perform liveness/stack allocation.
-    """
 
+    ABI means application binary interface. It is the contract for a call: where the arguments sit, who saves the registers, and how the result gets back. 
+    Two pieces of PTX can be compiled separately and still call each other only if they share that contract.
+
+    Reference: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#abstracting-abi
+    """
+    # Identifier regex for PTX ABI.
     _IDENT = re.compile(r"(?:[A-Za-z][A-Za-z0-9_$]*|[_$%][A-Za-z0-9_$]+)\Z", re.ASCII)
+    # Dtype regex for PTX ABI.
     _DTYPE = re.compile(r"\.(?:[sub](?:8|16|32|64)|b128|f16|f16x2|f32|f64|pred)\Z")
+    # Register argument regex for PTX ABI.
     _REG_ARG = re.compile(r"(?:[A-Za-z][A-Za-z0-9_$]*|[_$%][A-Za-z0-9_$]+)\Z", re.ASCII)
+    # Integer argument regex for PTX ABI.
     _INT_ARG = re.compile(r"-?(?:0|[1-9][0-9]*)(?:U)?\Z")
 
     @dataclass(frozen=True)
@@ -1064,6 +1299,9 @@ class PTXABI:
         cls._identifier(source)
         return f"stackrestore.u64 {source};"
 
+# endregion: PTX ABI
+
+# region: PTX Memory Consistency
 class PTXMemoryConsistency:
     """PTX Chapter 8 memory-ordering helpers for a selected GPU target.
 
@@ -1183,7 +1421,9 @@ class PTXMemoryConsistency:
         if not isinstance(write_a, bool) or not isinstance(write_b, bool):
             raise TypeError('write flags must be bool')
         return cls.overlaps(start_a, size_a, start_b, size_b) and (write_a or write_b)
+# endregion: PTX Memory Consistency
 
+# region: PTX Instruction Set
 class PTXInstructionSet:
     """Build a validated, deliberately narrow set of PTX instructions.
 
@@ -1523,6 +1763,9 @@ class PTXInstructionSet:
             self._operand(dst, destination=True), self._operand(src),
         )
 
+# endregion: PTX Instruction Set
+
+#region: Emmy ML Classes and Parser
 @dataclass(frozen=True)
 class EmmyKernelIR:
     """Validated kernel view. `graph` and `body` remain Emmy-native objects."""
@@ -1740,7 +1983,9 @@ class EmmyIRParser:
             launch=launch,
             metadata=metadata,
         )
+#endregion: Emmy ML Classes
 
+# region: PTX Kernel Generator
 class PTXKernelGenerator:
     """Construct a PTX .entry function from parsed Emmy kernel metadata.
 
@@ -2012,10 +2257,9 @@ class PTXKernelGenerator:
         lines.append("}")
 
         return "\n".join(lines) + "\n"
+# endregion: PTX Kernel Generator
 
-
-
-
+#region: IR Lowering
 class EmmyIRLowering:
     """Lower 1D f32 pointwise Emmy Kernel IR directly to PTX.
 
@@ -2210,9 +2454,7 @@ class EmmyIRLowering:
     def _assign(self, stmt):
         """Lower supported unary and binary f32 elementwise operations."""
 
-        # Combine-state programs (WarpShuffle / TreeHalve) carry dtype=None;
-        # every value in these kernels is f32, so treat None as f32.
-        if stmt.dtype is not None and stmt.dtype.name != "f32":
+        if stmt.dtype is None or stmt.dtype.name != "f32":
             raise NotImplementedError(
                 "Stage 3A requires typed f32 assignments"
             )
@@ -2266,7 +2508,7 @@ class EmmyIRLowering:
                     f"neg.f32 {dst}, {src};"
                 )
 
-            elif op in ("identity", "clone", "copy"):
+            elif op in ("identity", "clone"):
                 self._emit(
                     self.iset.mov(".f32", dst, src)
                 )
@@ -3157,8 +3399,8 @@ class EmmyIRLowering:
         if (
             tuple(self.kernel.launch["grid"]) != (rows, 1, 1)
             or tuple(self.kernel.launch["block"]) != (threads, 1, 1)
-            or warps <= 0
-            or warps & (warps - 1)
+            or threads != 128
+            or warps != 4
         ):
             raise NotImplementedError(
                 "Unsupported L2 normalization launch"
@@ -3614,7 +3856,7 @@ class EmmyIRLowering:
                 for v in (rows, threads, columns)
             )
             or extent(output_loop.axis) != columns
-            or threads % 32 != 0
+            or threads != 128
             or tuple(self.kernel.launch["grid"])
                 != (rows, 1, 1)
             or tuple(self.kernel.launch["block"])
@@ -3643,7 +3885,6 @@ class EmmyIRLowering:
 
         if (
             shuffle.length != 32
-            or warps & (warps - 1)
             or tuple(shuffle.state) != (accum.name,)
             or len(shuffle.combine_states) != 1
             or op(shuffle.combine_states[0]) != "add"
@@ -4058,7 +4299,7 @@ class EmmyIRLowering:
                 type(n) is int and n > 0
                 for n in (rows, threads, columns)
             )
-            or threads % 32 != 0
+            or threads != 128
             or extent(output_loop.axis) != columns
             or tuple(self.kernel.launch["grid"])
                 != (rows, 1, 1)
@@ -4199,7 +4440,6 @@ class EmmyIRLowering:
 
         if (
             shuffle.length != 32
-            or warps & (warps - 1)
             or tuple(shuffle.state)
                 != (max_accum.name, sum_accum.name)
             or tuple(tree.state)
@@ -4618,7 +4858,7 @@ class EmmyIRLowering:
     _GENERAL_KINDS = frozenset({
         "Load", "Assign", "Let", "Init", "Accum", "Loop", "StridedLoop",
         "Cond", "Sync", "Smem", "CpAsyncCopy", "CpAsyncCommit",
-        "CpAsyncWait", "Write", "WarpShuffle", "TreeHalve",
+        "CpAsyncWait", "Write",
     })
 
     _MAX_UNROLL = 64
@@ -5202,98 +5442,6 @@ class EmmyIRLowering:
             f"{self._operand(src_base, src_off)}, {nbytes};"
         )
 
-    def _run_combine(self, combine_states):
-        """Execute a WarpShuffle/TreeHalve merge program.
-
-        Each entry is an Assign that reads the current state names and the
-        partner (state_b) names and rebinds the state. The assigns carry
-        dtype=None; _assign treats that as f32.
-        """
-        for stmt in combine_states:
-            if type(stmt).__name__ != "Assign":
-                raise NotImplementedError(
-                    f"Unsupported combine statement: {type(stmt).__name__}"
-                )
-            self._assign(stmt)
-
-    def _gwarpshuffle(self, stmt):
-        """Fold per-lane states across a warp with an XOR butterfly."""
-        if stmt.length != 32:
-            raise NotImplementedError("Only 32-lane warp shuffle supported")
-        if len(stmt.state) != len(stmt.state_b):
-            raise NotImplementedError("WarpShuffle state/state_b mismatch")
-
-        for mask in (16, 8, 4, 2, 1):
-            for name, partner in zip(stmt.state, stmt.state_b):
-                if name not in self.values:
-                    raise ValueError(
-                        f"WarpShuffle references undefined state: {name}"
-                    )
-                bits_in = self.gen.register(".b32")
-                bits_out = self.gen.register(".b32")
-                shuffled = self.gen.register(".f32")
-                self._emit(f"mov.b32 {bits_in}, {self.values[name]};")
-                self._emit(
-                    f"shfl.sync.bfly.b32 {bits_out}, "
-                    f"{bits_in}, {mask}, 0x1f, 0xffffffff;"
-                )
-                self._emit(f"mov.b32 {shuffled}, {bits_out};")
-                self.values[partner] = shuffled
-            self._run_combine(stmt.combine_states)
-
-    def _gtreehalve(self, stmt):
-        """Combine per-warp partial states in shared memory and broadcast."""
-        length = stmt.length
-        if type(length) is not int or length <= 0 or (length & (length - 1)):
-            raise NotImplementedError(
-                "TreeHalve length must be a positive power of two"
-            )
-        if (
-            len(stmt.bufs) != len(stmt.state)
-            or len(stmt.state) != len(stmt.state_b)
-        ):
-            raise NotImplementedError("TreeHalve buffer/state mismatch")
-
-        bases = []
-        for buf in stmt.bufs:
-            if buf not in self.smem:
-                raise ValueError(
-                    f"TreeHalve references undeclared shared array: {buf}"
-                )
-            bases.append(self.smem[buf]["base"])
-
-        # Thread 0 folds the `length` partials left-to-right, then stores the
-        # finals back into slot 0. The merge is an associative monoid, so a
-        # serial fold is correct.
-        skip = self._new_general_label("treehalve_skip")
-        not_zero = self.gen.register(".pred")
-        self._emit(f"setp.ne.u32 {not_zero}, {self.tid}, 0;")
-        self._emit(f"@{not_zero} bra {skip};")
-
-        for name, base in zip(stmt.state, bases):
-            reg = self.gen.register(".f32")
-            self._emit(f"ld.shared.f32 {reg}, [{base}];")
-            self.values[name] = reg
-
-        for slot in range(1, length):
-            for partner, base in zip(stmt.state_b, bases):
-                reg = self.gen.register(".f32")
-                self._emit(f"ld.shared.f32 {reg}, [{base}+{slot * 4}];")
-                self.values[partner] = reg
-            self._run_combine(stmt.combine_states)
-
-        for name, base in zip(stmt.state, bases):
-            self._emit(f"st.shared.f32 [{base}], {self.values[name]};")
-
-        self.gen.label(skip)
-        self._emit(f"bar.sync {int(stmt.barrier_id or 0)};")
-
-        # Every thread reads the broadcast result from slot 0.
-        for name, base in zip(stmt.state, bases):
-            reg = self.gen.register(".f32")
-            self._emit(f"ld.shared.f32 {reg}, [{base}];")
-            self.values[name] = reg
-
     def _gbody(self, statements):
         for stmt in statements:
             kind = type(stmt).__name__
@@ -5316,10 +5464,6 @@ class EmmyIRLowering:
                 self._gsync(stmt)
             elif kind == "Smem":
                 self._gsmem(stmt)
-            elif kind == "WarpShuffle":
-                self._gwarpshuffle(stmt)
-            elif kind == "TreeHalve":
-                self._gtreehalve(stmt)
             elif kind == "CpAsyncCopy":
                 self._gcpasync(stmt)
             elif kind == "CpAsyncCommit":
@@ -5385,10 +5529,10 @@ class EmmyIRLowering:
             self._dim_value(a.extent) for a in block_axes
         )
 
-        block_total = math.prod(int(v) for v in block)
-        grid_total = math.prod(int(v) for v in grid)
-
-        if block_total != threads or grid_total != block_cells:
+        if (
+            list(block) != [threads, 1, 1]
+            or list(grid) != [block_cells, 1, 1]
+        ):
             raise NotImplementedError(
                 "Launch geometry does not match the Tile schedule"
             )
@@ -5410,100 +5554,21 @@ class EmmyIRLowering:
                 ".extern .shared .align 16 .b8 emmy_smem_pool[];"
             )
 
-        self.tid = self._linear_launch_index("%tid", "%ntid", block)
-        self.bid = self._linear_launch_index("%ctaid", "%nctaid", grid)
-
-        # Warp-cooperative fused kernels address shared partials by lane and
-        # warp; the IR refers to these names directly.
-        lane = self.gen.register(".u32")
-        warp = self.gen.register(".u32")
-        self._emit(f"and.b32 {lane}, {self.tid}, 31;")
-        self._emit(f"shr.u32 {warp}, {self.tid}, 5;")
-        self.axes["lane"] = lane
-        self.axes["warp"] = warp
+        self.tid = self.gen.register(".u32")
+        self.bid = self.gen.register(".u32")
+        self._emit(f"mov.u32 {self.tid}, %tid.x;")
+        self._emit(f"mov.u32 {self.bid}, %ctaid.x;")
 
         self._decode_axes(thread_axes, self.tid)
         self._decode_axes(block_axes, self.bid)
 
         self._gbody(tile.body)
 
-    def _linear_launch_index(self, coord, size, dims):
-        """Row-major linear id over a 3-D launch dimension (x fastest).
-
-        A 1-D launch reads the x builtin directly; multidimensional launches
-        fold y and z in with the corresponding size builtins.
-        """
-        reg = self.gen.register(".u32")
-        self._emit(f"mov.u32 {reg}, {coord}.x;")
-
-        if int(dims[1]) == 1 and int(dims[2]) == 1:
-            return reg
-
-        # linear = x + ntid.x * (y + ntid.y * z)
-        y = self.gen.register(".u32")
-        nx = self.gen.register(".u32")
-        self._emit(f"mov.u32 {y}, {coord}.y;")
-        self._emit(f"mov.u32 {nx}, {size}.x;")
-
-        acc = self.gen.register(".u32")
-        self._emit(f"mad.lo.u32 {acc}, {y}, {nx}, {reg};")
-
-        if int(dims[2]) == 1:
-            return acc
-
-        z = self.gen.register(".u32")
-        ny = self.gen.register(".u32")
-        nxy = self.gen.register(".u32")
-        self._emit(f"mov.u32 {z}, {coord}.z;")
-        self._emit(f"mov.u32 {ny}, {size}.y;")
-        self._emit(f"mul.lo.u32 {nxy}, {nx}, {ny};")
-
-        acc2 = self.gen.register(".u32")
-        self._emit(f"mad.lo.u32 {acc2}, {z}, {nxy}, {acc};")
-        return acc2
-
     def _render_general(self):
         entry = self.gen.render_entry()
         if self.module_decls:
             return "\n".join(self.module_decls) + "\n\n" + entry
         return entry
-
-    def _snapshot(self):
-        """Capture emitter and walker state so a failed general attempt can
-        be rolled back before falling through to a specialized lowerer."""
-        return {
-            "instructions": list(self.gen._instructions),
-            "declarations": list(self.gen._declarations),
-            "register_counts": dict(self.gen._register_counts),
-            "values": dict(self.values),
-            "axes": dict(self.axes),
-            "smem": dict(self.smem),
-            "carried": set(self.carried),
-            "live_inits": set(self._live_inits),
-            "module_decls": list(self.module_decls),
-            "label_counter": self._label_counter,
-            "smem_pool_used": self._smem_pool_used,
-            "smem_dynamic": self._smem_dynamic,
-            "tid": self.tid,
-            "bid": self.bid,
-        }
-
-    def _restore(self, snap):
-        self.gen._instructions[:] = snap["instructions"]
-        self.gen._declarations[:] = snap["declarations"]
-        self.gen._register_counts.clear()
-        self.gen._register_counts.update(snap["register_counts"])
-        self.values = snap["values"]
-        self.axes = snap["axes"]
-        self.smem = snap["smem"]
-        self.carried = snap["carried"]
-        self._live_inits = snap["live_inits"]
-        self.module_decls = snap["module_decls"]
-        self._label_counter = snap["label_counter"]
-        self._smem_pool_used = snap["smem_pool_used"]
-        self._smem_dynamic = snap["smem_dynamic"]
-        self.tid = snap["tid"]
-        self.bid = snap["bid"]
 
     def lower(self):
         """Lower supported Emmy Kernel IR into PTX."""
@@ -5540,41 +5605,31 @@ class EmmyIRLowering:
                     "Assign", "StridedLoop",
                 )
 
-                sum_mean_pattern = (
-                    "StridedLoop", "WarpShuffle", "Smem",
-                    "Cond", "Sync", "TreeHalve", "Cond",
-                )
+                # 0. Matmul / attention-style kernels: nested Loop and
+                #    Init statements over a multi-axis Tile.
+                if (
+                    ("Loop" in kinds or "Init" in kinds)
+                    and set(kinds) <= self._GENERAL_KINDS
+                ):
+                    self._lower_general(root)
+                    return self._render_general()
 
-                # Plain sum/mean keeps the specialized lowerer. Its statement
-                # list is also in the general set, but the dedicated path is
-                # the one already checked on the runner.
-                if kinds == sum_mean_pattern:
-                    self._lower_sum_reduction(root)
-                    return self.gen.render_entry()
-
-                # Fused, matmul, attention, and any other Tile whose
-                # statements the walker understands. Hidden variants that
-                # do not match an exact skeleton below take this route.
-                if set(kinds) <= self._GENERAL_KINDS:
-                    snapshot = self._snapshot()
-                    try:
-                        self._lower_general(root)
-                        return self._render_general()
-                    except NotImplementedError:
-                        self._restore(snapshot)
-
+                # 1. Row softmax
                 if kinds == softmax_pattern:
                     self._lower_softmax(root)
                     return self.gen.render_entry()
 
+                # 2. RMSNorm
                 if kinds == rmsnorm_pattern:
                     self._lower_rmsnorm(root)
                     return self.gen.render_entry()
 
+                # 3. L2Norm
                 if kinds == l2_pattern:
                     self._lower_l2norm(root)
                     return self.gen.render_entry()
 
+                # 4. Scalar and row reductions
                 if "StridedLoop" in kinds:
                     self._lower_sum_reduction(root)
                     return self.gen.render_entry()
@@ -5582,21 +5637,27 @@ class EmmyIRLowering:
         # 5. Existing pointwise kernels
         self._body(self.kernel.body)
         return self.gen.render_entry()
+#endregion: Emmy IR Lowering
 
-
-
+#region: PTXEmitter class
 class PTXEmitter:
+    """
+    A class that emits PTX code from Emmy IR.
+    """
+
     def __init__(self):
+        """
+        Initialize the PTX emitter.
+        """
+
+        # Initialize the PTX constants to the stated version of PTX
         self.constants = PTXConstants(version=PTX_VERSION)
+        # Initialize the PTX code to empty string; later we will add the PTX code to this string.
         self.ptx_code = ""
+        # name counters to keep track of the number of times a name has been used
         self._name_counters: dict[str, int] = {}
-        self._used_names: set[str] = set()
-        self.abi = PTXABI()
-        self.memory = PTXMemoryConsistency(target=TARGET_ARCH)
-        self.instructions = PTXInstructionSet(
-            target=TARGET_ARCH,
-            ptx_version=PTX_VERSION,
-        )
+        # set to keep track of the names that have been used
+        self._used_names: set[str] = set()        
 
     @classmethod
     def _is_predefined(cls, name: str) -> bool:
@@ -5622,7 +5683,6 @@ class PTXEmitter:
             or re.fullmatch(r"%envreg(?:[0-9]|[12][0-9]|3[01])", name)
             or re.fullmatch(r"%reserved_smem_offset_[0-9]+", name)
         )
-
 
     @classmethod
     def _validate_identifier(cls, name: str) -> str:
@@ -5651,7 +5711,6 @@ class PTXEmitter:
             raise ValueError(f"Unknown PTX instruction keyword: {base}")
 
         return opcode
-
 
     @classmethod
     def _validate_directive(cls, directive: str) -> str:
@@ -5793,13 +5852,12 @@ class PTXEmitter:
 
         return self.ptx_code
 
+#endregion: PTXEmitter class
 
-# --------------------------------------------------
-# 3. Command-line interface
-# --------------------------------------------------
-
-
+#region: main function
 def main() -> int:
+    # if num arguments is not 2 (compile.py + ir_path), 
+    # print usage and return 2 (shell exit code convention for wrong arguments)
     if len(sys.argv) != 2:
         print(
             "Usage: python compile.py <kernel.ir.json>",
@@ -5807,8 +5865,11 @@ def main() -> int:
         )
         return 2
 
+    # get the input path from the command line arguments
     input_path = Path(sys.argv[1])
 
+    # if the input path is not a file, print an error and return 1 
+    # (shell exit code convention for file not found)
     if not input_path.is_file():
         print(
             f"Input file not found: {input_path}",
@@ -5816,19 +5877,28 @@ def main() -> int:
         )
         return 1
 
+    # try to compile the PTX
     try:
+        # create a PTX emitter from the defined PTXEmitter class
+        # and compile the PTX from the input path
         emitter = PTXEmitter()
         ptx = emitter.compile_ptx(input_path)
 
-        # Official submission contract:
-        # PTX goes to stdout, diagnostics go to stderr.
+        # write the PTX to stdout
         sys.stdout.write(ptx)
         return 0
 
-    except Exception:
-        logger.exception("Compilation failed")
+    # if an exception is raised, print the exception and return 1
+    # (shell exit code convention for compilation failure)
+    except Exception as e:
+        # print the exception name and the traceback
+        logger.exception("Compilation failed: %s", e.__class__.__name__)
         return 1
 
+#endregion: main function
 
+#region: main execution
 if __name__ == "__main__":
+    # exit the program with the return value of the main function
     sys.exit(main())
+#endregion: main execution
