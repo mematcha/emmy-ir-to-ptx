@@ -49,7 +49,9 @@ def test_rmsnorm_scalar_parameters():
 def test_rmsnorm_arithmetic():
     ptx = generate_ptx()
     assert "sqrt.rn.f32" in ptx
-    assert ptx.count("rcp.rn.f32") == 2
+    # 1 / count and 1 / rms, both rounded to nearest.
+    assert ptx.count("div.rn.f32") == 2
+    assert "0f3f800000" in ptx
     assert "mul.f32" in ptx
     assert "add.f32" in ptx
 

@@ -49,9 +49,9 @@ def test_softmax_has_exponentials(ptx):
 
 
 def test_softmax_has_reduction_barriers(ptx):
-    # After the warp-leader stores: one CTA barrier, then TreeHalve's
-    # broadcast barrier. The online combine is a single pass, not two.
-    assert ptx.count("bar.sync 0;") == 2
+    # The max pass and the sum pass each store warp partials,
+    # then broadcast the reduced value. Two barriers per pass.
+    assert ptx.count("bar.sync 0;") == 4
 
 
 def test_softmax_uses_block_local_indexing(ptx):
@@ -61,7 +61,9 @@ def test_softmax_uses_block_local_indexing(ptx):
 
 
 def test_softmax_writes_results(ptx):
-    assert "rcp.rn.f32" in ptx
+    # 1 / row_sum, rounded to nearest.
+    assert "div.rn.f32" in ptx
+    assert "0f3f800000" in ptx
     assert "st.global.f32" in ptx
 
 

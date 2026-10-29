@@ -56,7 +56,9 @@ def test_l2norm_normalization():
     ptx = get_ptx()
 
     assert "sqrt.rn.f32" in ptx
-    assert "rcp.rn.f32" in ptx
+    # 1 / norm, rounded to nearest.
+    assert "div.rn.f32" in ptx
+    assert "0f3f800000" in ptx
     assert "st.global.f32" in ptx
 
 
